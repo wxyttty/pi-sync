@@ -105,6 +105,8 @@ interface SyncConfig {
   backupProviders: boolean;
   backupSkills: boolean;
   backupExtensions: boolean;
+  /** Agent-level config: ~/.pi/web-search.json, ~/.pi/agent/{mcp.json,AGENTS.md}, ~/.pi/agent/pi-blackhole/pi-blackhole-config.json */
+  backupAgentConfig: boolean;
 }
 
 /** Multi-profile store written to sync_config.json (v2). */
@@ -134,6 +136,7 @@ function defaultConfig(name = "default"): SyncConfig {
     backupProviders: true,
     backupSkills: true,
     backupExtensions: true,
+    backupAgentConfig: true,
   };
 }
 
@@ -182,6 +185,7 @@ function normalizeConfig(data: Partial<SyncConfig> | undefined, fallbackName?: s
     backupProviders: d.backupProviders !== false,
     backupSkills: d.backupSkills !== false,
     backupExtensions: d.backupExtensions !== false,
+    backupAgentConfig: d.backupAgentConfig !== false,
   };
 }
 
@@ -549,8 +553,14 @@ export default function (pi: ExtensionAPI) {
 
 
   function validateArchiveEntries(entries: string[]): void {
-    const allowedTopLevel = new Set(["config", "skills", "extensions"]);
+    const allowedTopLevel = new Set(["config", "skills", "extensions", "agent-config"]);
     const allowedConfigFiles = new Set(["models.json", "settings.json", "auth.json"]);
+    // agent-config/ 下白名单：web-search.json 与 agent/ 子树（路径自描述，不再枚举）
+    const allowedAgentConfigTop = new Set(["web-search.json", "agent"]);
+    // agent-config/agent/ 下白名单：mcp.json、AGENTS.md、pi-blackhole/ 子树
+    const allowedAgentConfigAgent = new Set(["mcp.json", "AGENTS.md", "pi-blackhole"]);
+    // agent-config/agent/pi-blackhole/ 下仅允许 pi-blackhole-config.json
+    const allowedAgentConfigBlackhole = new Set(["pi-blackhole-config.json"]);
 
     // Ignore empty / root-only noise left after normalizing "./"
     const meaningful = entries.filter((e) => e && e !== "." && e !== "./");
@@ -565,13 +575,53 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Unsafe archive path rejected: ${entry}`);
       }
 
-      const [topLevel, secondPart] = pathParts;
+      const [topLevel, secondPart, thirdPart, fourthPart] = pathParts;
       if (!topLevel || !allowedTopLevel.has(topLevel)) {
         throw new Error(`Unexpected top-level archive entry rejected: ${entry}`);
       }
 
       if (topLevel === "config" && secondPart && !allowedConfigFiles.has(secondPart)) {
         throw new Error(`Unexpected config file rejected: ${entry}`);
+      }
+
+      // agent-config/ 路径白名单
+      if (topLevel === "agent-config") {
+        if (!secondPart) {
+          throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+        }
+        if (!allowedAgentConfigTop.has(secondPart)) {
+          throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+        }
+        // agent-config/web-search.json：必须是文件，不能再有下级
+        if (secondPart === "web-search.json" && thirdPart) {
+          throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+        }
+        // agent-config/agent/ 下级白名单
+        if (secondPart === "agent") {
+          if (!thirdPart) {
+            throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+          }
+          if (!allowedAgentConfigAgent.has(thirdPart)) {
+            throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+          }
+          // agent-config/agent/{mcp.json,AGENTS.md}：必须是文件，不能再有下级
+          if ((thirdPart === "mcp.json" || thirdPart === "AGENTS.md") && fourthPart) {
+            throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+          }
+          // agent-config/agent/pi-blackhole/ 下级白名单：仅 pi-blackhole-config.json
+          if (thirdPart === "pi-blackhole") {
+            if (!fourthPart) {
+              throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+            }
+            if (!allowedAgentConfigBlackhole.has(fourthPart)) {
+              throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+            }
+            // pi-blackhole-config.json 不能再有下级
+            if (pathParts.length > 5) {
+              throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+            }
+          }
+        }
       }
     }
   }
@@ -580,6 +630,7 @@ export default function (pi: ExtensionAPI) {
     const hasConfig = entries.some((entry) => entry === "config" || entry.startsWith("config/"));
     const hasSkills = entries.some((entry) => entry === "skills" || entry.startsWith("skills/"));
     const hasExtensions = entries.some((entry) => entry === "extensions" || entry.startsWith("extensions/"));
+    const hasAgentConfig = entries.some((entry) => entry === "agent-config" || entry.startsWith("agent-config/"));
     const plan: string[] = [];
 
     if (hasConfig) {
@@ -590,6 +641,9 @@ export default function (pi: ExtensionAPI) {
     }
     if (hasExtensions) {
       plan.push(config.backupExtensions ? "Extensions will be merged/overwritten; current extensions get a timestamped backup folder." : "Extensions are present but skipped by current settings.");
+    }
+    if (hasAgentConfig) {
+      plan.push(config.backupAgentConfig ? "Agent config (web-search.json, mcp.json, AGENTS.md, pi-blackhole-config.json) will be overwritten; current files get timestamped .bak copies." : "Agent config is present but skipped by current settings.");
     }
 
     if (plan.length === 0) {
@@ -957,6 +1011,31 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      if (config.backupAgentConfig) {
+        const piHome = path.join(os.homedir(), ".pi");
+        const acDest = path.join(tempDir, "agent-config");
+        const acAgentDest = path.join(acDest, "agent");
+        const acBlackholeDest = path.join(acAgentDest, "pi-blackhole");
+        const agentFiles = [
+          { src: path.join(piHome, "web-search.json"), dest: path.join(acDest, "web-search.json"), label: "Agent Config: web-search.json" },
+          { src: path.join(agentDir, "mcp.json"), dest: path.join(acAgentDest, "mcp.json"), label: "Agent Config: mcp.json" },
+          { src: path.join(agentDir, "AGENTS.md"), dest: path.join(acAgentDest, "AGENTS.md"), label: "Agent Config: AGENTS.md" },
+          { src: path.join(agentDir, "pi-blackhole", "pi-blackhole-config.json"), dest: path.join(acBlackholeDest, "pi-blackhole-config.json"), label: "Agent Config: pi-blackhole-config.json" },
+        ];
+        let anyAgentConfigAdded = false;
+        for (const { src, dest, label } of agentFiles) {
+          if (fs.existsSync(src)) {
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.copyFileSync(src, dest);
+            contents.push(label);
+            anyAgentConfigAdded = true;
+          }
+        }
+        if (anyAgentConfigAdded) {
+          await yieldToUI();
+        }
+      }
+
       if (contents.length === 0) {
         throw new Error("No components selected or found to backup!");
       }
@@ -1031,6 +1110,44 @@ export default function (pi: ExtensionAPI) {
         copyRecursiveSync(extSrc, extDest);
         await yieldToUI();
         restored.push(`Extensions directory (merged)`);
+      }
+
+      // Agent config: ~/.pi/web-search.json, ~/.pi/agent/{mcp.json,AGENTS.md},
+      // ~/.pi/agent/pi-blackhole/pi-blackhole-config.json。
+      // archive 内是 agent-config/{web-search.json, agent/{mcp.json,AGENTS.md,pi-blackhole/pi-blackhole-config.json}}
+      // 整体路径与 ~/.pi/ 结构一致，逐文件恢复，已存在 → .bak-{ts}
+      const acSrc = path.join(tempDir, "agent-config");
+      if (fs.existsSync(acSrc) && config.backupAgentConfig) {
+        const piHome = path.join(os.homedir(), ".pi");
+        const acFiles: Array<{ src: string; dest: string; label: string }> = [];
+        const wsSrc = path.join(acSrc, "web-search.json");
+        if (fs.existsSync(wsSrc)) {
+          acFiles.push({ src: wsSrc, dest: path.join(piHome, "web-search.json"), label: "Agent Config: web-search.json" });
+        }
+        const acAgentSrc = path.join(acSrc, "agent");
+        const mcpSrc = path.join(acAgentSrc, "mcp.json");
+        if (fs.existsSync(mcpSrc)) {
+          acFiles.push({ src: mcpSrc, dest: path.join(agentDir, "mcp.json"), label: "Agent Config: mcp.json" });
+        }
+        const agentsMdSrc = path.join(acAgentSrc, "AGENTS.md");
+        if (fs.existsSync(agentsMdSrc)) {
+          acFiles.push({ src: agentsMdSrc, dest: path.join(agentDir, "AGENTS.md"), label: "Agent Config: AGENTS.md" });
+        }
+        const bhSrc = path.join(acAgentSrc, "pi-blackhole", "pi-blackhole-config.json");
+        if (fs.existsSync(bhSrc)) {
+          acFiles.push({ src: bhSrc, dest: path.join(agentDir, "pi-blackhole", "pi-blackhole-config.json"), label: "Agent Config: pi-blackhole-config.json" });
+        }
+        for (const { src, dest, label } of acFiles) {
+          if (fs.existsSync(dest)) {
+            const bakPath = `${dest}.bak-${timestampForBackup()}`;
+            fs.copyFileSync(dest, bakPath);
+            safetyBackups.push(bakPath);
+          }
+          fs.mkdirSync(path.dirname(dest), { recursive: true });
+          fs.copyFileSync(src, dest);
+          restored.push(label);
+        }
+        await yieldToUI();
       }
 
       return { restored, safetyBackups };
@@ -1185,6 +1302,7 @@ export default function (pi: ExtensionAPI) {
         `Backup Providers & Config: ${cfgConfig.backupProviders ? "ON" : "OFF"}`,
         `Backup Skills: ${cfgConfig.backupSkills ? "ON" : "OFF"}`,
         `Backup Extensions: ${cfgConfig.backupExtensions ? "ON" : "OFF"}`,
+        `Backup Agent Config: ${cfgConfig.backupAgentConfig ? "ON" : "OFF"}`,
         "───────────────",
         "s Save",
         "x Back",
@@ -1282,7 +1400,8 @@ export default function (pi: ExtensionAPI) {
 
       if (selected.startsWith("Backup Providers & Config:")) { cfgConfig.backupProviders = !cfgConfig.backupProviders; continue; }
       if (selected.startsWith("Backup Skills:")) { cfgConfig.backupSkills = !cfgConfig.backupSkills; continue; }
-      if (selected.startsWith("Backup Extensions:")) { cfgConfig.backupExtensions = !cfgConfig.backupExtensions; }
+      if (selected.startsWith("Backup Extensions:")) { cfgConfig.backupExtensions = !cfgConfig.backupExtensions; continue; }
+      if (selected.startsWith("Backup Agent Config:")) { cfgConfig.backupAgentConfig = !cfgConfig.backupAgentConfig; continue; }
     }
   }
 
