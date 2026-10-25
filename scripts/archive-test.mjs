@@ -71,6 +71,8 @@ rejects("unnormalized ./ entry", ["./config/models.json"]);
 accepts("plugin config allowlist file", ["config/open-tui.json"]);
 accepts("dotted plugin config", ["config/pi-cache-optimizer.stats.json"]);
 accepts("skills/extensions only", ["skills/a/SKILL.md", "extensions/b/index.ts"]);
+accepts("agent-config layout", ["agent-config", "agent-config/agent", "agent-config/agent/pi-blackhole", "agent-config/web-search.json", "agent-config/agent/AGENTS.md", "agent-config/agent/pi-blackhole/pi-blackhole-config.json"]);
+accepts("legacy agent-config mcp.json", ["agent-config/agent/mcp.json"]);
 
 // ── invalid layouts ──────────────────────────────────────────────────────
 rejects("empty", []);
@@ -79,6 +81,9 @@ rejects("absolute path", ["/etc/passwd"]);
 rejects("parent traversal", ["config/../evil.json"]);
 rejects("windows drive", ["C:/Users/x/config/settings.json"]);
 rejects("unknown top-level", ["README.md"]);
+rejects("agent-config unknown file", ["agent-config/other.json"]);
+rejects("agent-config nested too deep", ["agent-config/agent/pi-blackhole/sub/x.json"]);
+rejects("agent-config dir as file", ["agent-config/web-search.json/x"]);
 rejects("nested config path", ["config/sub/dir/settings.json"]);
 rejects("reserved sync_config.json", ["config/sync_config.json"]);
 rejects("reserved case variant", ["config/Sync_Config.JSON"]);

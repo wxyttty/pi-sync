@@ -61,6 +61,18 @@ export function parseManifest(raw: unknown): SyncManifest {
   if (!home || !agentDir || !platform) {
     throw new Error("manifest.json source is incomplete (home/agentDir/platform required)");
   }
+  if (!/^[a-z0-9]+$/i.test(platform)) {
+    throw new Error(`manifest.json source.platform is not a valid platform id: ${JSON.stringify(platform)}`);
+  }
+  const win = platform === "win32";
+  const isAbsoluteOnSource = (p: string): boolean =>
+    win ? /^[a-zA-Z]:[\\/]/.test(p) || /^\\\\/.test(p) : p.startsWith("/");
+  if (!isAbsoluteOnSource(home)) {
+    throw new Error(`manifest.json source.home is not an absolute path on ${platform}: ${JSON.stringify(home)}`);
+  }
+  if (!isAbsoluteOnSource(agentDir)) {
+    throw new Error(`manifest.json source.agentDir is not an absolute path on ${platform}: ${JSON.stringify(agentDir)}`);
+  }
   return {
     version: 1,
     piSyncVersion: typeof m.piSyncVersion === "string" ? m.piSyncVersion : "",
@@ -143,28 +155,45 @@ export function isPathLikeValue(s: string): boolean {
  */
 export function splitUnderBase(value: string, base: string, sourcePlatform: string): string | undefined {
   const win = sourcePlatform === "win32";
-  // Normalize to a single separator: backslash for Windows sources, slash for POSIX.
+  // Normalize to a single separator: backslash for Windows sources, slash for
+  // POSIX (a literal backslash is a valid POSIX filename character).
   const sep = win ? "\\" : "/";
   const norm = (p: string): string => {
-    let n = p.replace(/[\\/]+/g, sep);
-    // strip trailing separator (but keep bare drive roots like "C:\")
-    if (n.length > 3 && n.endsWith(sep)) n = n.slice(0, -1);
-    return win ? n.toLowerCase() : n;
+    let n = win ? p.replace(/[\\/]+/g, "\\") : p.replace(/\/+/g, "/");
+    // strip one trailing separator, but keep drive roots like "C:\"
+    const isDriveRoot = win && /^[a-zA-Z]:\\?$/.test(n);
+    if (!isDriveRoot && n.length > 1 && n.endsWith(sep)) n = n.slice(0, -1);
+    return n;
   };
+  // Case-insensitive comparison on Windows, but preserve the original case in
+  // the returned relative part. toLowerCase can change string length for some
+  // Unicode; bail out (undefined) in that rare case rather than mis-slice.
+  const fold = (s: string): string => (win ? s.toLowerCase() : s);
   const nv = norm(value);
   const nb = norm(base);
-  if (nv === nb) return "";
-  if (nv.startsWith(nb + sep)) {
-    // rel from the ORIGINAL value, with mixed separators tolerated
-    return value.slice(base.length).replace(/^[\\/]+/, "");
+  const fv = fold(nv);
+  const fb = fold(nb);
+  if (fv === fb) return "";
+  if (fv.length !== nv.length || fb.length !== nb.length) return undefined;
+  // Boundary: nb may already end with the separator (drive root "C:\").
+  const boundary = fb.endsWith(sep) ? fb : fb + sep;
+  if (fv.startsWith(boundary)) {
+    // Relative part from the NORMALIZED value — separator counts can differ
+    // between value and base, so never slice the original strings.
+    return nv.slice(boundary.length);
   }
   return undefined;
 }
 
-/** Join a relative path (source separators) onto a target base with local separators. */
-function joinTarget(base: string, rel: string): string {
+
+/**
+ * Join a relative path (source separators) onto a target base with local
+ * separators. Split on both separators only for Windows sources; POSIX
+ * sources keep literal backslashes inside filenames.
+ */
+function joinTarget(base: string, rel: string, sourcePlatform: string): string {
   if (!rel) return base;
-  const parts = rel.split(/[\\/]+/).filter(Boolean);
+  const parts = (sourcePlatform === "win32" ? rel.split(/[\\/]+/) : rel.split("/+")).filter(Boolean);
   return nodePath.join(base, ...parts);
 }
 
@@ -178,11 +207,12 @@ function rebaseString(
 
   const relAgent = splitUnderBase(s, ctx.sourceAgentDir, ctx.sourcePlatform);
   if (relAgent !== undefined) {
-    return { value: joinTarget(ctx.targetAgentDir, relAgent), rebase: { from: s, to: joinTarget(ctx.targetAgentDir, relAgent) } };
+    const to = joinTarget(ctx.targetAgentDir, relAgent, ctx.sourcePlatform);
+    return { value: to, rebase: { from: s, to } };
   }
   const relHome = splitUnderBase(s, ctx.sourceHome, ctx.sourcePlatform);
   if (relHome !== undefined) {
-    const to = joinTarget(ctx.targetHome, relHome);
+    const to = joinTarget(ctx.targetHome, relHome, ctx.sourcePlatform);
     return { value: to, rebase: { from: s, to } };
   }
   return { value: s };
@@ -320,9 +350,20 @@ function rebaseSettings(obj: Record<string, unknown>, ctx: RebaseContext): Field
     const v = obj[key];
     if (typeof v === "string") value[key] = rebaseWholeString(`settings.${key}`, v, ctx, outcome);
   }
-  // externalEditor is a command string; only rebase when it is a bare path.
-  if (typeof obj.externalEditor === "string" && isPathLikeValue(obj.externalEditor)) {
-    value.externalEditor = rebaseWholeString("settings.externalEditor", obj.externalEditor, ctx, outcome);
+  // externalEditor is a command string; rebase only when it is a bare path
+  // (no whitespace). Command strings with arguments are report-only.
+  const ee = obj.externalEditor;
+  if (typeof ee === "string" && ee) {
+    if (isPathLikeValue(ee) && !/\s/.test(ee)) {
+      value.externalEditor = rebaseWholeString("settings.externalEditor", ee, ctx, outcome);
+    } else if (embedsSourcePath(ee, ctx)) {
+      outcome.warnings.push({
+        field: "settings.externalEditor",
+        value: redactValue(ee),
+        kind: "command-path",
+        hint: "command embeds a source-machine path; edit manually if needed",
+      });
+    }
   }
 
   // npmCommand is a command + args; report only when it embeds a source path.
@@ -484,6 +525,20 @@ function rebaseModels(obj: Record<string, unknown>, ctx: RebaseContext): FieldOu
   return outcome;
 }
 
+/**
+ * Redact a value for diagnostics: strip URL query strings (may carry API
+ * keys), then truncate. Never print full secrets in warnings.
+ */
+export function redactValue(v: string): string {
+  let s = v;
+  // strip URL query (and fragment) — e.g. ?exaApiKey=…
+  if (/^https?:\/\//i.test(s)) {
+    const q = s.search(/[?#]/);
+    if (q >= 0) s = s.slice(0, q) + "?…";
+  }
+  return s.length > 120 ? s.slice(0, 117) + "…" : s;
+}
+
 /** True when the string contains the source home/agentDir as a substring. */
 function embedsSourcePath(s: string, ctx: RebaseContext): boolean {
   if (typeof s !== "string" || s.length < 4) return false;
@@ -494,42 +549,61 @@ function embedsSourcePath(s: string, ctx: RebaseContext): boolean {
   return hay.includes(home) || hay.includes(agent);
 }
 
-/** Deep report-only scan for source paths in fields we never rewrite. */
+/**
+ * Deep report-only scan for source paths in fields we never rewrite.
+ * Field paths use the SAME representation as the per-file rules
+ * ("settings.extensions[0]"), so deduplication against transformed fields
+ * works. Scalar array leaves are visited (not just object values).
+ */
 function scanGeneric(
   obj: unknown,
   ctx: RebaseContext,
-  fileName: string,
+  fieldRoot: string,
   outcome: FieldOutcome,
+  touched: Set<string>,
   prefix: string,
   depth: number,
 ): void {
-  if (depth > 12 || obj === null || typeof obj !== "object") return;
+  if (depth > 12) return;
+  const fieldFor = (key: string): string => (prefix ? `${prefix}.${key}` : key);
   if (Array.isArray(obj)) {
-    obj.forEach((v, i) => scanGeneric(v, ctx, fileName, outcome, `${prefix}[${i}]`, depth + 1));
+    obj.forEach((v, i) => {
+      const child = `${prefix}[${i}]`;
+      if (typeof v === "string") visitLeaf(v, child);
+      else if (v !== null && typeof v === "object") scanGeneric(v, ctx, fieldRoot, outcome, touched, child, depth + 1);
+    });
     return;
   }
+  if (obj === null || typeof obj !== "object") return;
   for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    const field = fieldFor(k);
     if (typeof v === "string") {
-      if (embedsSourcePath(v, ctx)) {
-        outcome.warnings.push({
-          field: `${fileName}:${prefix}${prefix ? "." : ""}${k}`,
-          value: v.length > 120 ? v.slice(0, 117) + "…" : v,
-          kind: "unrebased-path",
-          hint: "field embeds a source-machine path; not rewritten (unknown field)",
-        });
-      } else {
-        const cls = classifyUrl(v);
-        if (cls === "loopback") {
-          outcome.warnings.push({
-            field: `${fileName}:${prefix}${prefix ? "." : ""}${k}`,
-            value: v,
-            kind: "loopback-url",
-            hint: "device-local URL — needs a service running on this machine",
-          });
-        }
-      }
+      visitLeaf(v, field);
     } else if (v !== null && typeof v === "object") {
-      scanGeneric(v, ctx, fileName, outcome, `${prefix}${prefix ? "." : ""}${k}`, depth + 1);
+      scanGeneric(v, ctx, fieldRoot, outcome, touched, field, depth + 1);
+    }
+  }
+
+  function visitLeaf(v: string, field: string): void {
+    const full = `${fieldRoot}.${field}`;
+    if (touched.has(full)) return; // already rebased or reported by per-file rules
+    if (embedsSourcePath(v, ctx)) {
+      outcome.warnings.push({
+        field: full,
+        value: redactValue(v),
+        kind: "unrebased-path",
+        hint: "field embeds a source-machine path; not rewritten (unknown field)",
+      });
+      return;
+    }
+    const cls = classifyUrl(v);
+    if (cls === "loopback" || cls === "private") {
+      outcome.warnings.push({
+        field: full,
+        value: redactValue(v),
+        kind: cls === "loopback" ? "loopback-url" : "private-url",
+        hint: "device/LAN-local URL — may need a local service on this machine",
+      });
     }
   }
 }
@@ -554,13 +628,19 @@ export function rebaseConfigFile(
       : emptyOutcome();
 
   // Generic report-only scan for every file (including the known ones, for
-  // fields the per-file rules do not cover).
+  // fields the per-file rules do not cover). Fields already rebased or
+  // reported by the per-file rules are suppressed via the touched set.
   if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) {
-    const before = outcome.warnings.length;
-    scanGeneric(obj, ctx, fileName, outcome, "", 0);
-    // Keep generic scan from duplicating per-file warnings on the same field.
-    const seen = new Set(outcome.warnings.slice(0, before).map((w) => w.field));
-    outcome.warnings = outcome.warnings.filter((w, i) => i < before || !seen.has(w.field));
+    const fieldRoot =
+      fileName === "settings.json" ? "settings"
+      : fileName === "mcp.json" ? "mcp"
+      : fileName === "models.json" ? "models"
+      : fileName;
+    const touched = new Set<string>([
+      ...outcome.rebases.map((r) => r.field),
+      ...outcome.warnings.map((w) => w.field),
+    ]);
+    scanGeneric(obj, ctx, fieldRoot, outcome, touched, "", 0);
   }
 
   return {

@@ -19,6 +19,31 @@ export const RESERVED_CONFIG_FILES = new Set(["sync_config.json"]);
 export const SAFE_CONFIG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/;
 
 /**
+ * Agent-level config files packed under agent-config/ (toggle backupAgentConfig).
+ * `archive` is the path inside the backup; `dest` describes where it restores.
+ */
+export const AGENT_CONFIG_FILES: ReadonlyArray<{ archive: string; dest: "pi-home" | "agent-dir"; file: string }> = [
+  { archive: "agent-config/web-search.json", dest: "pi-home", file: "web-search.json" },
+  { archive: "agent-config/agent/AGENTS.md", dest: "agent-dir", file: "AGENTS.md" },
+  {
+    archive: "agent-config/agent/pi-blackhole/pi-blackhole-config.json",
+    dest: "agent-dir",
+    file: "pi-blackhole/pi-blackhole-config.json",
+  },
+  // Legacy layout from the pre-1.4 master branch: mcp.json lived here.
+  // New backups pack mcp.json under config/; restore accepts both.
+  { archive: "agent-config/agent/mcp.json", dest: "agent-dir", file: "mcp.json" },
+];
+
+/** Exact set of allowed agent-config/ entry paths (files + parent dirs). */
+const AGENT_CONFIG_ALLOWED = new Set<string>([
+  "agent-config",
+  "agent-config/agent",
+  "agent-config/agent/pi-blackhole",
+  ...AGENT_CONFIG_FILES.map((f) => f.archive),
+]);
+
+/**
  * Validate normalized archive entries before extraction.
  *
  * Layout contract:
@@ -30,7 +55,7 @@ export const SAFE_CONFIG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\.json$/;
  * reserved config files (sync credentials), and case-colliding config names.
  */
 export function validateArchiveEntries(entries: string[]): void {
-  const allowedTopLevel = new Set(["config", "skills", "extensions", "manifest.json"]);
+  const allowedTopLevel = new Set(["config", "skills", "extensions", "agent-config", "manifest.json"]);
 
   // Ignore empty / root-only noise left after normalizing "./"
   const meaningful = entries.filter((e) => e && e !== "." && e !== "./");
@@ -56,6 +81,14 @@ export function validateArchiveEntries(entries: string[]): void {
     if (topLevel === "manifest.json") {
       if (pathParts.length > 1) {
         throw new Error(`Unexpected archive entry rejected: ${entry}`);
+      }
+      continue;
+    }
+
+    if (topLevel === "agent-config") {
+      // Exact whitelist of agent-config paths (files + parent dir entries).
+      if (!AGENT_CONFIG_ALLOWED.has(entry)) {
+        throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
       }
       continue;
     }

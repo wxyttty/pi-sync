@@ -25,7 +25,7 @@
 需要 [Pi coding agent](https://github.com/earendil-works/pi-coding-agent)，以及可用的 WebDAV（TeraCLOUD、坚果云、Nextcloud、ownCloud、自建等）。
 
 ```bash
-pi install git:github.com/BevalZ/pi-sync@v1.4.0
+pi install git:github.com/BevalZ/pi-sync@v1.4.1
 ```
 
 然后重启 Pi，或执行 `/reload`。
@@ -47,7 +47,7 @@ TUI 提示：`↵` 选择 · `↑↓` 导航 · `Esc` 取消。
 
 ```bash
 # 1. 安装
-pi install git:github.com/BevalZ/pi-sync@v1.4.0
+pi install git:github.com/BevalZ/pi-sync@v1.4.1
 
 # 2. 打开菜单（若尚未配置 WebDAV，会先进入设置向导）
 /sync
@@ -66,10 +66,11 @@ pi install git:github.com/BevalZ/pi-sync@v1.4.0
 |------|------|------|
 | Config | 开 | `models.json`、`settings.json`、`auth.json`、`mcp.json` |
 | 额外配置文件 | 关（白名单） | agent 目录根下的插件配置，如 `pi-fff.json` —— 在 **Configure Active Profile → Extra config files** 中挑选 |
+| Agent 配置 | 开 | `~/.pi/web-search.json`、`<agent-dir>/AGENTS.md`、`<agent-dir>/pi-blackhole/pi-blackhole-config.json`（归档目录 `agent-config/`） |
 | Skills | 开 | 整个 `~/.pi/agent/skills` |
 | Extensions | 开 | `~/.pi/agent/extensions`（zip 中会排除 sync 插件自身） |
 
-`sync_config.json`（云端凭证）永远不会被打包或恢复。`mcp-auth.json`（OAuth 授权）默认也不同步 —— 只有在你清楚后果时才手动加入白名单。
+`sync_config.json`（云端凭证）永远不会被打包或恢复。`mcp-auth.json`（OAuth 授权）默认不同步 —— 发现菜单中已排除，只能手动加入白名单；且恢复端同样校验授权：归档里未经本机 profile 授权的配置文件只会列为"跳过"，绝不写入。
 
 可在 **Configure Sync Settings** 中分别开关。
 
@@ -81,7 +82,9 @@ v1.4.0+ 生成的备份带有 `manifest.json`，记录源主机的 home 与 agen
 - 资源控制前缀（`!`、`+`、`-`）与非路径条目（`npm:…`、`git:…`、`builtin:…`、URL）原样保留。
 - 其余内容**只报告不改写**：恢复预览与报告会列出本机回环地址（`127.0.0.1` / `localhost`）、局域网地址（`192.168.x.x` 等）、本机不存在的绝对路径、以及内嵌源机器路径的命令 —— 附带 `models.providers.magpie.baseUrl` 这样的字段名，便于快速修复。
 - 完整的重定位/警告计划会在**确认恢复之前**展示；所见即所改（归档先解压到暂存区检查，确认前不会写入 agent 目录）。
+- 配置文件只有**本机 profile 授权**（核心文件 + 本机白名单）才会恢复；归档中未授权的文件会列为"跳过"，绝不写入。
 - 无 manifest 的旧版归档按原样恢复，并提示手动检查路径。manifest 损坏会让检查直接失败，而不是被静默忽略。
+- 诊断信息会脱敏（URL 查询串截断），报告里不会出现 URL 中的 API key。
 
 白名单中的未知插件配置文件永远不会被改写 —— 只扫描、只报告。
 
@@ -97,7 +100,8 @@ pi_sync_backup_2026-07-14_20260714120000_windows11.zip
 
 ### 恢复时的安全机制
 
-- 归档先解压到暂存目录并检查（条目校验、拒绝符号链接、manifest、路径重定位），完整计划展示后才写入任何文件
+- 解压前先做成员类型校验：tar 成员必须是普通文件/目录，符号链接/硬链接/设备成员在解压前即被拒绝
+- 归档解压到暂存目录后再次检查（暂存树内不得有符号链接），完整计划展示后才写入任何文件
 - 覆盖前，已有配置文件会生成带时间戳的 `.bak` 副本
 - 已有 skills / extensions 目录会先改名为 `*-backup-<timestamp>`，再替换/合并
 - 恢复前会展示计划（含路径适配），并要求确认
@@ -195,7 +199,7 @@ pi-sync/
 需要 [Pi coding agent](https://github.com/earendil-works/pi-coding-agent)，以及可用的 WebDAV（TeraCLOUD、坚果云、Nextcloud、ownCloud、自建等）。
 
 ```bash
-pi install git:github.com/BevalZ/pi-sync@v1.4.0
+pi install git:github.com/BevalZ/pi-sync@v1.4.1
 ```
 
 然后重启 Pi，或执行 `/reload`。
@@ -217,7 +221,7 @@ TUI 提示：`↵` 选择 · `↑↓` 导航 · `Esc` 取消。
 
 ```bash
 # 1. 安装
-pi install git:github.com/BevalZ/pi-sync@v1.4.0
+pi install git:github.com/BevalZ/pi-sync@v1.4.1
 
 # 2. 打开菜单（若尚未配置 WebDAV，会先进入设置向导）
 /sync
@@ -236,10 +240,11 @@ pi install git:github.com/BevalZ/pi-sync@v1.4.0
 |------|------|------|
 | Config | 开 | `models.json`、`settings.json`、`auth.json`、`mcp.json` |
 | 额外配置文件 | 关（白名单） | agent 目录根下的插件配置，如 `pi-fff.json` —— 在 **Configure Active Profile → Extra config files** 中挑选 |
+| Agent 配置 | 开 | `~/.pi/web-search.json`、`<agent-dir>/AGENTS.md`、`<agent-dir>/pi-blackhole/pi-blackhole-config.json`（归档目录 `agent-config/`） |
 | Skills | 开 | 整个 `~/.pi/agent/skills` |
 | Extensions | 开 | `~/.pi/agent/extensions`（zip 中会排除 sync 插件自身） |
 
-`sync_config.json`（云端凭证）永远不会被打包或恢复。`mcp-auth.json`（OAuth 授权）默认也不同步 —— 只有在你清楚后果时才手动加入白名单。
+`sync_config.json`（云端凭证）永远不会被打包或恢复。`mcp-auth.json`（OAuth 授权）默认不同步 —— 发现菜单中已排除，只能手动加入白名单；且恢复端同样校验授权：归档里未经本机 profile 授权的配置文件只会列为"跳过"，绝不写入。
 
 可在 **Configure Sync Settings** 中分别开关。
 
@@ -251,7 +256,9 @@ v1.4.0+ 生成的备份带有 `manifest.json`，记录源主机的 home 与 agen
 - 资源控制前缀（`!`、`+`、`-`）与非路径条目（`npm:…`、`git:…`、`builtin:…`、URL）原样保留。
 - 其余内容**只报告不改写**：恢复预览与报告会列出本机回环地址（`127.0.0.1` / `localhost`）、局域网地址（`192.168.x.x` 等）、本机不存在的绝对路径、以及内嵌源机器路径的命令 —— 附带 `models.providers.magpie.baseUrl` 这样的字段名，便于快速修复。
 - 完整的重定位/警告计划会在**确认恢复之前**展示；所见即所改（归档先解压到暂存区检查，确认前不会写入 agent 目录）。
+- 配置文件只有**本机 profile 授权**（核心文件 + 本机白名单）才会恢复；归档中未授权的文件会列为"跳过"，绝不写入。
 - 无 manifest 的旧版归档按原样恢复，并提示手动检查路径。manifest 损坏会让检查直接失败，而不是被静默忽略。
+- 诊断信息会脱敏（URL 查询串截断），报告里不会出现 URL 中的 API key。
 
 白名单中的未知插件配置文件永远不会被改写 —— 只扫描、只报告。
 
@@ -267,7 +274,8 @@ pi_sync_backup_2026-07-14_20260714120000_windows11.zip
 
 ### 恢复时的安全机制
 
-- 归档先解压到暂存目录并检查（条目校验、拒绝符号链接、manifest、路径重定位），完整计划展示后才写入任何文件
+- 解压前先做成员类型校验：tar 成员必须是普通文件/目录，符号链接/硬链接/设备成员在解压前即被拒绝
+- 归档解压到暂存目录后再次检查（暂存树内不得有符号链接），完整计划展示后才写入任何文件
 - 覆盖前，已有配置文件会生成带时间戳的 `.bak` 副本
 - 已有 skills / extensions 目录会先改名为 `*-backup-<timestamp>`，再替换/合并
 - 恢复前会展示计划（含路径适配），并要求确认
@@ -339,6 +347,15 @@ pi-sync/
 ```
 
 ## 更新日志
+
+### v1.4.1
+
+- **恢复端执行白名单授权**：归档中的配置文件只有本机 profile 授权（核心 + 白名单）才会恢复；未授权文件列为"跳过"
+- **解压前成员类型校验**：非普通文件/目录的 tar 成员（符号链接/硬链接/设备）在解压前拒绝；ZIP 安全拒绝不再回退到外部解压器；目标文件为符号链接时替换链接本身，目标目录为符号链接时中止恢复
+- **路径语义加固**：Windows 盘根、重复/尾部分隔符、POSIX 字面反斜杠；`externalEditor` 仅在纯路径时重定位（带参数的命令只报告）；manifest 必须携带绝对源路径
+- **只报告扫描修复**：标量数组叶子纳入扫描（`{"paths": ["/home/…"]}` 会告警）；已重定位字段不再重复告警；诊断中 URL 查询串脱敏
+- **Agent 配置备份**（来自 master）：`~/.pi/web-search.json`、`AGENTS.md`、`pi-blackhole/pi-blackhole-config.json` 归入 `agent-config/`，开关 **Backup Agent Config**；兼容旧版 `agent-config/agent/mcp.json` 归档
+- 测试：89 路径 + 29 归档 + 56 端到端（含对抗性符号链接归档、未授权文件跳过、取消后一切不变）
 
 ### v1.4.0
 

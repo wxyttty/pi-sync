@@ -259,7 +259,7 @@ console.log("rebase unknown plugin config (report-only):");
   const r = rebaseConfigFile("pi-fff.json", pluginCfg, linuxCtx);
   check("value untouched", r.value.toolPath === "/home/alice/tools/t.sh");
   check("rebase recorded? NO", r.rebases.length === 0);
-  check("warning emitted", r.warnings.some((w) => w.kind === "unrebased-path" && w.field === "pi-fff.json:toolPath"));
+  check("warning emitted", r.warnings.some((w) => w.kind === "unrebased-path" && w.field === "pi-fff.json.toolPath"));
 }
 
 // ── tilde values pass through untouched ──────────────────────────────────
@@ -269,6 +269,82 @@ console.log("tilde passthrough:");
   check("~/ extension untouched", r.value.extensions[0] === "~/dev/ext/index.ts");
   check("~ shellPath untouched", r.value.shellPath === "~/.local/bin/zsh");
   check("no rebases", r.rebases.length === 0);
+}
+
+// ── edge cases: separators, drive roots, POSIX backslashes ───────────────
+console.log("separator edge cases:");
+check("trailing separator on value", splitUnderBase("/home/alice/", "/home/alice", "linux") === "");
+check("trailing separator on base", splitUnderBase("/home/alice/x", "/home/alice/", "linux") === "x");
+check("repeated separators", splitUnderBase("//home//alice//x", "/home/alice", "linux") === "x");
+check("repeated separators on base", splitUnderBase("/home/alice/x", "//home//alice", "linux") === "x");
+check("posix literal backslash kept", splitUnderBase("/home/alice/my\\file", "/home/alice", "linux") === "my\\file");
+check("win drive root base", splitUnderBase("C:\\Users\\wxy", "C:\\", "win32") === "Users\\wxy");
+check("win drive root base no slash", splitUnderBase("C:\\Users\\wxy", "C:", "win32") === "Users\\wxy");
+check("win value equals drive root", splitUnderBase("C:\\", "C:\\", "win32") === "");
+check("win repeated separators", splitUnderBase("C:\\Users\\\\wxy", "C:\\Users", "win32") === "wxy");
+
+{
+  // POSIX literal backslash survives the rebase as one filename
+  const r = rebaseConfigFile("settings.json", { extensions: ["/home/alice/my\\file"] }, linuxCtx);
+  check("posix backslash filename rebased as single part",
+    r.value.extensions[0] === join(targetHome, "my\\file"), `got ${r.value.extensions[0]}`);
+}
+
+// ── externalEditor: bare path vs command string ──────────────────────────
+console.log("externalEditor:");
+{
+  const r = rebaseConfigFile("settings.json", { externalEditor: "/home/alice/bin/editor --wait" }, linuxCtx);
+  check("command with args NOT rebased", r.value.externalEditor === "/home/alice/bin/editor --wait");
+  check("command with args reported", r.warnings.some((w) => w.field === "settings.externalEditor" && w.kind === "command-path"));
+  check("no rebase recorded for command", r.rebases.length === 0);
+}
+{
+  const r = rebaseConfigFile("settings.json", { externalEditor: "/home/alice/bin/editor" }, linuxCtx);
+  check("bare path rebased", r.value.externalEditor === join(targetHome, "bin", "editor"));
+}
+
+// ── manifest root validation ──────────────────────────────────────────────
+console.log("manifest validation:");
+threw = false;
+try { parseManifest({ version: 1, source: { platform: "linux", home: "relative/path", agentDir: "/abs" } }); } catch { threw = true; }
+check("relative home rejected", threw);
+threw = false;
+try { parseManifest({ version: 1, source: { platform: "win32", home: "/home/alice", agentDir: "C:\\x" } }); } catch { threw = true; }
+check("posix home on win32 platform rejected", threw);
+threw = false;
+try { parseManifest({ version: 1, source: { platform: "not a platform!", home: "/x", agentDir: "/x" } }); } catch { threw = true; }
+check("invalid platform id rejected", threw);
+threw = false;
+try { parseManifest({ version: 1, source: { platform: "win32", home: "C:\\Users\\wxy", agentDir: "\\\\server\\share\\pi" } }); } catch { threw = true; }
+check("UNC agentDir accepted", !threw);
+
+// ── scalar array leaves are scanned ───────────────────────────────────────
+console.log("scalar array leaves:");
+{
+  const r = rebaseConfigFile("pi-fff.json", { paths: ["/home/alice/tools", "/other"], nested: [{ cfg: "/home/alice/x" }] }, linuxCtx);
+  check("array scalar path warned", r.warnings.some((w) => w.field === "pi-fff.json.paths[0]" && w.kind === "unrebased-path"));
+  check("array non-path not warned", !r.warnings.some((w) => w.field === "pi-fff.json.paths[1]"));
+  check("object-in-array leaf warned", r.warnings.some((w) => w.field === "pi-fff.json.nested[0].cfg"));
+}
+{
+  // legacy settings.extensions arrays are scanned too
+  const r = rebaseConfigFile("pi-fff.json", { extensions: ["/home/alice/dev/ext"] }, linuxCtx);
+  check("legacy-style extensions array scanned", r.warnings.some((w) => w.field === "pi-fff.json.extensions[0]"));
+}
+
+// ── dedup: rebased fields not re-reported by generic scan ────────────────
+console.log("dedup:");
+{
+  const r = rebaseConfigFile("settings.json", { extensions: ["/home/alice/x"] }, linuxCtx);
+  const fields = r.warnings.filter((w) => w.field === "settings.extensions[0]").map((w) => w.kind);
+  check("rebased field has only the missing-path warning", fields.length === 1 && fields[0] === "missing-path", JSON.stringify(fields));
+}
+{
+  // URL query secrets are redacted in warnings
+  const r = rebaseConfigFile("pi-fff.json", { url: "http://127.0.0.1:8080/x?token=SECRETSECRET" }, linuxCtx);
+  const w = r.warnings.find((x) => x.field === "pi-fff.json.url");
+  check("loopback in unknown field warned", Boolean(w));
+  check("query secret redacted", w && !w.value.includes("SECRETSECRET"), `got ${w && w.value}`);
 }
 
 // ── cleanup ──────────────────────────────────────────────────────────────

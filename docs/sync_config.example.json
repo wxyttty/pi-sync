@@ -22,7 +22,8 @@
       "extraConfigFiles": [
         "pi-fff.json",
         "open-tui.json"
-      ]
+      ],
+      "backupAgentConfig": true
     },
     "r2-temp": {
       "name": "Cloudflare R2",
@@ -41,7 +42,8 @@
       "backupProviders": true,
       "backupSkills": true,
       "backupExtensions": true,
-      "extraConfigFiles": []
+      "extraConfigFiles": [],
+      "backupAgentConfig": true
     }
   }
 }

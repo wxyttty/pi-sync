@@ -6,6 +6,7 @@ import * as os from "node:os";
 import { timestampForBackup, ensureDir, writeJsonAtomic, readJsonSafe } from "../_shared/json-io";
 import { getAgentDir } from "../_shared/agent-dirs";
 import {
+  AGENT_CONFIG_FILES,
   CORE_CONFIG_FILES,
   RESERVED_CONFIG_FILES,
   SAFE_CONFIG_NAME_RE,
@@ -14,6 +15,7 @@ import {
 import {
   classifyUrl,
   parseManifest,
+  redactValue,
   rebaseConfigFile,
   rebaseContextFromManifest,
   type PathRebase,
@@ -29,7 +31,7 @@ import {
   sha256Hex,
   signAwsV4,
 } from "../_shared/s3-sigv4";
-import { extractZipToDir, isZipFile, listZipEntries } from "../_shared/zip-utils";
+import { extractZipToDir, isZipFile, isZipSecurityError, listZipEntries } from "../_shared/zip-utils";
 
 /** Host platform tag for backup filenames (windows11/macos/linux/…). */
 function platformTag(): string {
@@ -94,7 +96,7 @@ const TAR_TIMEOUT_MS = 300_000;
 const CLOUD_FETCH_TIMEOUT_MS = 120_000;
 
 /** pi-sync version stamped into backup manifests. */
-const PI_SYNC_VERSION = "1.4.0";
+const PI_SYNC_VERSION = "1.4.1";
 
 type SyncBackend = "webdav" | "s3";
 
@@ -129,6 +131,11 @@ interface SyncConfig {
    * configs like pi-fff.json). Empty by default — discovery is opt-in.
    */
   extraConfigFiles: string[];
+  /**
+   * Agent-level config: ~/.pi/web-search.json, <agentDir>/AGENTS.md,
+   * <agentDir>/pi-blackhole/pi-blackhole-config.json (archive dir agent-config/).
+   */
+  backupAgentConfig: boolean;
 }
 
 /** Multi-profile store written to sync_config.json (v2). */
@@ -159,6 +166,7 @@ function defaultConfig(name = "default"): SyncConfig {
     backupSkills: true,
     backupExtensions: true,
     extraConfigFiles: [],
+    backupAgentConfig: true,
   };
 }
 
@@ -223,6 +231,7 @@ function normalizeConfig(data: Partial<SyncConfig> | undefined, fallbackName?: s
     backupSkills: d.backupSkills !== false,
     backupExtensions: d.backupExtensions !== false,
     extraConfigFiles: sanitizeExtraConfigFiles(d.extraConfigFiles),
+    backupAgentConfig: d.backupAgentConfig !== false,
   };
 }
 
@@ -488,6 +497,9 @@ export default function (pi: ExtensionAPI) {
         extractZipToDir(archivePath, destDir);
         return;
       } catch (zipErr) {
+        // Security rejections (path traversal) must never fall back to an
+        // external extractor — that would bypass the rejection.
+        if (isZipSecurityError(zipErr)) throw zipErr;
         // Optional fallbacks if pure-JS fails (encrypted/unsupported method)
         const attempts: Array<{ cmd: string; args: string[] }> = [
           { cmd: "unzip", args: ["-o", archivePath, "-d", destDir] },
@@ -618,14 +630,82 @@ export default function (pi: ExtensionAPI) {
     warnings: PortabilityWarning[];
   }
 
+  interface StagedAgentConfigFile {
+    /** Path inside the archive, e.g. agent-config/agent/AGENTS.md. */
+    archive: string;
+    /** Staged absolute path. */
+    srcPath: string;
+    /** Where it restores: "pi-home" (~/.pi) or "agent-dir". */
+    destKind: "pi-home" | "agent-dir";
+    /** File path under the destination root. */
+    file: string;
+  }
+
   interface StagedRestore {
     stageDir: string;
     /** null = legacy archive without manifest (verbatim restore). */
     manifest: SyncManifest | null;
+    /** Authorized config files (core + this profile's allowlist). */
     configFiles: StagedConfigFile[];
+    /** Config files found in the archive but NOT authorized here. */
+    skippedConfigFiles: string[];
+    agentConfigFiles: StagedAgentConfigFile[];
     hasSkills: boolean;
     hasExtensions: boolean;
     entries: string[];
+  }
+
+  /**
+   * Pre-extraction validation: tar members must be plain files or directories.
+   * Symlink/hardlink/device/fifo members are rejected BEFORE extraction, so a
+   * crafted archive cannot write through links while being extracted.
+   * Listing failures (e.g. GNU tar on zip) are skipped — the pure-JS zip
+   * extractor writes regular files only, and assertNoSymlinks runs after.
+   */
+  async function assertArchiveMembersArePlain(archivePath: string): Promise<void> {
+    const attempts: string[][] = isGzipArchive(archivePath)
+      ? [["-t", "-v", "-z", "-f", archivePath]]
+      : [
+          ["-t", "-v", "-a", "-f", archivePath], // bsdtar auto-detects (incl. zip)
+          ["-t", "-v", "-f", archivePath], // plain tar
+        ];
+    for (const args of attempts) {
+      const r = await runCommand("tar", args, { timeoutMs: TAR_TIMEOUT_MS });
+      if (!r.ok) continue; // try next / skip validation
+      for (const line of r.stdout.split(/\r?\n/)) {
+        const token = line.trim().split(/\s+/)[0] || "";
+        const type = token.charAt(0);
+        if (!type) continue;
+        if (type !== "-" && type !== "d") {
+          throw new Error(
+            `Archive member is not a plain file/directory (type "${type}"): ${line.trim().slice(0, 120)}`,
+          );
+        }
+      }
+      return;
+    }
+  }
+
+  /** Destination file must not be a symlink: replace the link itself, never write through it. */
+  function replaceIfSymlink(destFile: string): void {
+    try {
+      if (fs.lstatSync(destFile).isSymbolicLink()) fs.unlinkSync(destFile);
+    } catch {
+      // does not exist — fine
+    }
+  }
+
+  /** Destination directory must not be a symlink (suspicious state — abort). */
+  function assertDirNotSymlink(dir: string, label: string): void {
+    let st;
+    try {
+      st = fs.lstatSync(dir);
+    } catch {
+      return; // does not exist — fine
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`${label} destination is a symbolic link: ${dir} — restore aborted; inspect your agent dir`);
+    }
   }
 
   /** Reject symbolic links anywhere in the staged tree (tar members can carry them). */
@@ -669,7 +749,7 @@ export default function (pi: ExtensionAPI) {
           } else if (HOME_ISH_RE.test(v)) {
             warnings.push({
               field,
-              value: v.length > 120 ? v.slice(0, 117) + "…" : v,
+              value: redactValue(v),
               kind: "unrebased-path",
               hint: "legacy archive: absolute home path restored as-is",
             });
@@ -687,13 +767,20 @@ export default function (pi: ExtensionAPI) {
    * Extract the archive into a staging dir, validate it, read the manifest,
    * and compute path rebases — WITHOUT touching the agent dir.
    * The confirm dialog then previews exactly what will be applied.
+   *
+   * Config files are filtered to what THIS profile authorizes (core files +
+   * its extra-config allowlist); anything else in the archive is reported as
+   * skipped and never restored.
    */
-  async function stageRestore(archivePath: string): Promise<StagedRestore> {
+  async function stageRestore(archivePath: string, config: SyncConfig): Promise<StagedRestore> {
     const stageDir = path.join(os.tmpdir(), `pi_sync_stage_${Date.now()}`);
     fs.mkdirSync(stageDir, { recursive: true });
     try {
       const entries = await listArchiveEntries(archivePath);
       validateArchiveEntries(entries);
+      // Validate member types BEFORE extraction so links cannot be followed
+      // while extracting. (Also re-checked on the staged tree afterwards.)
+      await assertArchiveMembersArePlain(archivePath);
       await extractArchiveTo(archivePath, stageDir);
       assertNoSymlinks(stageDir);
 
@@ -720,12 +807,39 @@ export default function (pi: ExtensionAPI) {
           })
         : null;
 
+      // ── Agent-config files (exact whitelist from archive-rules) ──
+      const agentConfigFiles: StagedAgentConfigFile[] = [];
+      let legacyMcpConsumed = false;
+      for (const spec of AGENT_CONFIG_FILES) {
+        const srcPath = path.join(stageDir, ...spec.archive.split("/"));
+        if (!fs.existsSync(srcPath)) continue;
+        // Legacy layout: mcp.json under agent-config/. Prefer config/mcp.json
+        // when the archive also has it; otherwise consume it as the mcp.json
+        // config file (subject to the same authorization rules).
+        if (spec.file === "mcp.json" && spec.archive !== "config/mcp.json") {
+          const modernMcp = path.join(stageDir, "config", "mcp.json");
+          if (fs.existsSync(modernMcp)) continue; // modern copy wins
+          agentConfigFiles.push({ archive: spec.archive, srcPath, destKind: spec.dest, file: spec.file });
+          legacyMcpConsumed = true;
+          continue;
+        }
+        agentConfigFiles.push({ archive: spec.archive, srcPath, destKind: spec.dest, file: spec.file });
+      }
+
+      // ── Config files: authorized set only ──
+      const authorized = new Set<string>([...CORE_CONFIG_FILES, ...config.extraConfigFiles]);
+      if (legacyMcpConsumed) authorized.add("mcp.json");
       const configFiles: StagedConfigFile[] = [];
+      const skippedConfigFiles: string[] = [];
       const configSrc = path.join(stageDir, "config");
       if (fs.existsSync(configSrc)) {
         for (const name of fs.readdirSync(configSrc).sort()) {
           const src = path.join(configSrc, name);
           if (!fs.statSync(src).isFile()) continue;
+          if (!authorized.has(name)) {
+            skippedConfigFiles.push(name);
+            continue;
+          }
           let parsed: unknown = undefined;
           let isJson = false;
           try {
@@ -753,6 +867,8 @@ export default function (pi: ExtensionAPI) {
         stageDir,
         manifest,
         configFiles,
+        skippedConfigFiles,
+        agentConfigFiles,
         hasSkills: fs.existsSync(path.join(stageDir, "skills")),
         hasExtensions: fs.existsSync(path.join(stageDir, "extensions")),
         entries,
@@ -783,6 +899,18 @@ export default function (pi: ExtensionAPI) {
     }
     if (staged.hasExtensions) {
       lines.push(config.backupExtensions ? "Extensions will be merged/overwritten; current extensions get a timestamped backup folder." : "Extensions are present but skipped by current settings.");
+    }
+
+    if (staged.agentConfigFiles.length > 0) {
+      const names = staged.agentConfigFiles.map((f) => f.file).join(", ");
+      lines.push(
+        config.backupAgentConfig
+          ? `Agent config files to restore: ${names}`
+          : `Agent config present but skipped by settings (${names})`,
+      );
+    }
+    if (staged.skippedConfigFiles.length > 0) {
+      lines.push(`Skipped (not authorized on this profile): ${staged.skippedConfigFiles.join(", ")}`);
     }
 
     lines.push("── Path portability ──");
@@ -830,6 +958,8 @@ export default function (pi: ExtensionAPI) {
     if (staged.configFiles.length > 0 && config.backupProviders) {
       for (const f of staged.configFiles) {
         const destFile = path.join(agentDir, f.name);
+        // A planted symlink would make the copy write elsewhere — replace it.
+        replaceIfSymlink(destFile);
         if (fs.existsSync(destFile)) {
           const bakPath = `${destFile}.bak-${timestampForBackup()}`;
           fs.copyFileSync(destFile, bakPath);
@@ -845,9 +975,29 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // Agent-config files (web-search.json → ~/.pi, others → agent dir).
+    if (staged.agentConfigFiles.length > 0 && config.backupAgentConfig) {
+      const piHome = path.join(os.homedir(), ".pi");
+      for (const f of staged.agentConfigFiles) {
+        const destRoot = f.destKind === "pi-home" ? piHome : agentDir;
+        const destFile = path.join(destRoot, ...f.file.split("/"));
+        replaceIfSymlink(destFile);
+        if (fs.existsSync(destFile)) {
+          const bakPath = `${destFile}.bak-${timestampForBackup()}`;
+          fs.copyFileSync(destFile, bakPath);
+          safetyBackups.push(bakPath);
+        }
+        fs.mkdirSync(path.dirname(destFile), { recursive: true });
+        fs.copyFileSync(f.srcPath, destFile);
+        restored.push(`Agent Config: ${f.file}`);
+      }
+      await yieldToUI();
+    }
+
     const skillsSrc = path.join(staged.stageDir, "skills");
     if (staged.hasSkills && config.backupSkills) {
       const skillsDest = path.join(agentDir, "skills");
+      assertDirNotSymlink(skillsDest, "skills");
       const skillsBackup = path.join(agentDir, `skills-backup-${timestampForBackup()}`);
       if (fs.existsSync(skillsDest)) {
         fs.renameSync(skillsDest, skillsBackup);
@@ -863,6 +1013,7 @@ export default function (pi: ExtensionAPI) {
     const extSrc = path.join(staged.stageDir, "extensions");
     if (staged.hasExtensions && config.backupExtensions) {
       const extDest = path.join(agentDir, "extensions");
+      assertDirNotSymlink(extDest, "extensions");
       const extBackup = path.join(agentDir, `extensions-backup-${timestampForBackup()}`);
       if (fs.existsSync(extDest)) {
         fs.mkdirSync(extBackup, { recursive: true });
@@ -1236,6 +1387,38 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // Agent-level config (archive dir agent-config/). mcp.json is packed
+      // under config/ as a core file — not duplicated here.
+      if (config.backupAgentConfig) {
+        const piHome = path.join(os.homedir(), ".pi");
+        const agentConfigFiles: Array<{ src: string; dest: string; label: string }> = [
+          {
+            src: path.join(piHome, "web-search.json"),
+            dest: path.join(tempDir, "agent-config", "web-search.json"),
+            label: "Agent Config: web-search.json",
+          },
+          {
+            src: path.join(agentDir, "AGENTS.md"),
+            dest: path.join(tempDir, "agent-config", "agent", "AGENTS.md"),
+            label: "Agent Config: AGENTS.md",
+          },
+          {
+            src: path.join(agentDir, "pi-blackhole", "pi-blackhole-config.json"),
+            dest: path.join(tempDir, "agent-config", "agent", "pi-blackhole", "pi-blackhole-config.json"),
+            label: "Agent Config: pi-blackhole-config.json",
+          },
+        ];
+        let anyAgentConfig = false;
+        for (const { src, dest, label } of agentConfigFiles) {
+          if (!fs.existsSync(src)) continue;
+          fs.mkdirSync(path.dirname(dest), { recursive: true });
+          fs.copyFileSync(src, dest);
+          contents.push(label);
+          anyAgentConfig = true;
+        }
+        if (anyAgentConfig) await yieldToUI();
+      }
+
       if (contents.length === 0) {
         throw new Error("No components selected or found to backup!");
       }
@@ -1413,6 +1596,7 @@ export default function (pi: ExtensionAPI) {
         `Backup Skills: ${cfgConfig.backupSkills ? "ON" : "OFF"}`,
         `Backup Extensions: ${cfgConfig.backupExtensions ? "ON" : "OFF"}`,
         `Extra config files: ${cfgConfig.extraConfigFiles.length ? cfgConfig.extraConfigFiles.join(", ") : "(none)"}`,
+        `Backup Agent Config: ${cfgConfig.backupAgentConfig ? "ON" : "OFF"}`,
         "───────────────",
         "s Save",
         "x Back",
@@ -1515,6 +1699,7 @@ export default function (pi: ExtensionAPI) {
         await showExtraConfigEditor(ctx, cfgConfig);
         continue;
       }
+      if (selected.startsWith("Backup Agent Config:")) { cfgConfig.backupAgentConfig = !cfgConfig.backupAgentConfig; continue; }
     }
   }
 
@@ -1532,6 +1717,8 @@ export default function (pi: ExtensionAPI) {
             if (RESERVED_CONFIG_FILES.has(name.toLowerCase())) return false;
             if ((CORE_CONFIG_FILES as string[]).includes(name)) return false;
             if (name === "models-store.json") return false; // cache, not config
+            if (name === "mcp-auth.json") return false; // OAuth grants — manual opt-in only
+            if (name === "auth.json") return false; // core, secret-bearing
             return true;
           })
           .sort();
@@ -1669,6 +1856,7 @@ export default function (pi: ExtensionAPI) {
       backupSkills: configs.some((c) => c.backupSkills),
       backupExtensions: configs.some((c) => c.backupExtensions),
       extraConfigFiles: Array.from(new Set(configs.flatMap((c) => c.extraConfigFiles || []))),
+      backupAgentConfig: configs.some((c) => c.backupAgentConfig),
     };
   }
 
@@ -1845,7 +2033,7 @@ export default function (pi: ExtensionAPI) {
         // nothing touches the agent dir until the user confirms.
         ctx.ui.notify("Inspecting archive (staging restore plan)...", "info");
         await yieldToUI();
-        const staged = await stageRestore(tempDownloadZip);
+        const staged = await stageRestore(tempDownloadZip, dlConfig);
         try {
           const preview = buildRestorePreview(staged, dlConfig);
           const confirmed = await ctx.ui.confirm(

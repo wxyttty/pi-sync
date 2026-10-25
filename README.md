@@ -25,7 +25,7 @@ If you run Pi on multiple PCs / WSL / servers, reinstalling models, skills, and 
 Requires [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) and either a **WebDAV** endpoint (TeraCLOUD, 坚果云 / Jianguoyun, Nextcloud, ownCloud, …) or an **S3-compatible** bucket (Amazon S3, MinIO, Cloudflare R2, …).
 
 ```bash
-pi install git:github.com/BevalZ/pi-sync@v1.4.0
+pi install git:github.com/BevalZ/pi-sync@v1.4.1
 ```
 
 Then restart Pi or run `/reload`.
@@ -50,7 +50,7 @@ Keyboard hints (as shown in the TUI): `↵` select · `↑↓` navigate · `Esc`
 
 ```bash
 # 1. Install
-pi install git:github.com/BevalZ/pi-sync@v1.4.0
+pi install git:github.com/BevalZ/pi-sync@v1.4.1
 
 # 2. Open the menu (first run starts the setup wizard if WebDAV is empty)
 /sync
@@ -116,10 +116,11 @@ See `docs/sync_config.example.json` for a no-secrets multi-profile template.
 |-----------|---------|-------|
 | Config | ON | `models.json`, `settings.json`, `auth.json`, `mcp.json` |
 | Extra config files | OFF (allowlist) | plugin configs in the agent dir root, e.g. `pi-fff.json` — pick files under **Configure Active Profile → Extra config files** |
+| Agent config | ON | `~/.pi/web-search.json`, `<agent-dir>/AGENTS.md`, `<agent-dir>/pi-blackhole/pi-blackhole-config.json` (archive dir `agent-config/`) |
 | Skills | ON | entire `~/.pi/agent/skills` |
 | Extensions | ON | `~/.pi/agent/extensions` (the sync plugin itself is excluded from the zip) |
 
-`sync_config.json` (cloud credentials) is never packed or restored. `mcp-auth.json` (OAuth grants) is not synced by default either — add it to the extra-config allowlist only if you understand the implications.
+`sync_config.json` (cloud credentials) is never packed or restored. `mcp-auth.json` (OAuth grants) is not synced by default either — it is excluded from discovery and can only be added to the allowlist manually, and even then an archive only restores allowlisted files on machines whose profile authorizes them.
 
 Toggle any of these under **Configure Active Profile**.
 
@@ -131,7 +132,9 @@ Backups made with v1.4.0+ carry a `manifest.json` that records the source machin
 - Resource control prefixes (`!`, `+`, `-`) and non-path entries (`npm:…`, `git:…`, `builtin:…`, URLs) pass through untouched.
 - Everything else is **report-only**: the restore preview and report list device-local URLs (`127.0.0.1` / `localhost`), LAN-private URLs (`192.168.x.x` …), absolute paths that do not exist here, and commands embedding source-machine paths — with field names like `models.providers.magpie.baseUrl` so you can fix them quickly.
 - The full rebase/warning plan is shown **before** you confirm the restore; what you see is exactly what gets applied (the archive is staged and inspected first, nothing touches your agent dir before confirmation).
+- Config files are restored only when **this machine's profile authorizes them** (core files + its own allowlist). Files present in the archive but not authorized here are listed as skipped and never written.
 - Legacy archives without a manifest restore verbatim, with a warning to review paths manually. A malformed manifest fails the inspection instead of being silently ignored.
+- Diagnostic values are redacted (URL query strings stripped) so API keys in URLs never appear in reports.
 
 Unknown plugin-config files from the allowlist are never rewritten — only scanned and reported.
 
@@ -147,7 +150,8 @@ The trailing platform tag (`windows11` / `windows10` / `macos` / `linux`) shows 
 
 ### Safety on restore
 
-- The archive is extracted to a staging directory first, inspected (entry validation, no symlinks, manifest, path rebases), and the full plan is shown before anything is written
+- The archive is validated before extraction: entry names must match the whitelist, and tar member **types** must be plain files/directories — symlink/hardlink/device members are rejected before anything is extracted
+- The archive is extracted to a staging directory, re-checked (no symlinks in the staged tree), and the full plan is shown before anything is written
 - Existing config files get a timestamped `.bak` copy before overwrite
 - Existing skills / extensions folders are renamed to `*-backup-<timestamp>` before replace/merge
 - Restore shows a plan (including path portability) and asks for confirmation
@@ -219,6 +223,15 @@ pi-sync/
 ```
 
 ## Changelog
+
+### v1.4.1
+
+- **Restore honors the extra-config allowlist**: archive config files are restored only when this machine's profile authorizes them (core + allowlist); unauthorized files are shown as skipped
+- **Pre-extraction member-type validation**: tar members that are not plain files/directories (symlink/hardlink/device) are rejected before extraction; ZIP security rejections no longer fall back to external extractors; symlinked destination files are replaced, symlinked destination directories abort the restore
+- **Path semantics hardened**: Windows drive roots, repeated/trailing separators, and POSIX literal backslashes handled; `externalEditor` is only rebased as a bare path (commands with args are report-only); manifests must carry absolute source roots
+- **Report-only scanner fixes**: scalar array leaves are now scanned (`{"paths": ["/home/…"]}` warns); no duplicate warnings for already-rebased fields; URL query secrets redacted in diagnostics
+- **Agent-config backup** (from master): `~/.pi/web-search.json`, `AGENTS.md`, `pi-blackhole/pi-blackhole-config.json` under `agent-config/`, toggle **Backup Agent Config**; legacy `agent-config/agent/mcp.json` archives still restore
+- Tests: 89 path + 29 archive + 56 end-to-end (incl. adversarial symlink archive, unauthorized-file skip, cancellation leaving everything unchanged)
 
 ### v1.4.0
 

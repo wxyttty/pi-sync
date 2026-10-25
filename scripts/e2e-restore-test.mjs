@@ -113,7 +113,21 @@ writeFileSync(join(srcStage, "config", "mcp.json"), JSON.stringify({
 writeFileSync(join(srcStage, "config", "pi-fff.json"), JSON.stringify({
   enableHomeDirScanning: false,
   toolPath: "/home/alice/tools/t.sh",
+  paths: ["/home/alice/tools"],
 }, null, 2), "utf-8");
+
+// NOT in this profile's allowlist → must be skipped on restore
+writeFileSync(join(srcStage, "config", "mcp-auth.json"), JSON.stringify({ evil: true }), "utf-8");
+writeFileSync(join(srcStage, "config", "rogue.json"), JSON.stringify({ rogue: true }), "utf-8");
+
+// agent-config (user's master feature). web-search.json omitted so the test
+// never writes into the real ~/.pi.
+mkdirSync(join(srcStage, "agent-config", "agent", "pi-blackhole"), { recursive: true });
+writeFileSync(join(srcStage, "agent-config", "agent", "AGENTS.md"), "# agents\n", "utf-8");
+writeFileSync(
+  join(srcStage, "agent-config", "agent", "pi-blackhole", "pi-blackhole-config.json"),
+  "{}", "utf-8",
+);
 
 writeFileSync(join(srcStage, "skills", "hello", "SKILL.md"), "# hello\n", "utf-8");
 writeFileSync(join(srcStage, "extensions", "shellkeeper-guard", "index.ts"), "// ext\n", "utf-8");
@@ -121,6 +135,22 @@ writeFileSync(join(srcStage, "extensions", "shellkeeper-guard", "index.ts"), "//
 const backupName = "pi_sync_backup_2026-07-14_20260714120000_linux.tar.gz";
 const archivePath = join(workDir, backupName);
 execFileSync("tar", ["-c", "-z", "-f", archivePath, "-C", srcStage, "."]);
+
+// ── Adversarial archive: contains a symlink member (type "l").
+// Without pre-extraction member-type validation, GNU tar would materialize
+// the symlink inside staging and later members could write through it.
+// The sentinel dir proves nothing outside staging is touched.
+const evilBackupName = "pi_sync_backup_2026-07-13_20260713120000_linux.tar.gz";
+const evilArchivePath = join(workDir, evilBackupName);
+const evilSrc = join(workDir, "evil-src");
+const sentinelDir = join(workDir, "sentinel");
+mkdirSync(join(evilSrc, "config"), { recursive: true });
+mkdirSync(sentinelDir, { recursive: true });
+writeFileSync(join(evilSrc, "config", "settings.json"), "{}", "utf-8");
+execFileSync("bash", [
+  "-c",
+  `set -e; cd "${evilSrc}"; mkdir -p skills; ln -s "${sentinelDir}" skills/link; tar -czf "${evilArchivePath}" config skills`,
+]);
 
 // ── Mock WebDAV server ───────────────────────────────────────────────────
 const uploads = [];
@@ -136,16 +166,22 @@ const server = createServer((req, res) => {
     return;
   }
   if (req.method === "PROPFIND") {
+    const entries = [backupName, evilBackupName]
+      .map(
+        (n) =>
+          `<d:response><d:href>/${n}</d:href><d:propstat><d:prop><d:displayname>${n}</d:displayname></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`,
+      )
+      .join("\n    ");
     const xml = `<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:">
-  <d:response><d:href>/${backupName}</d:href><d:propstat><d:prop><d:displayname>${backupName}</d:displayname></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+    ${entries}
 </d:multistatus>`;
     res.writeHead(207, { "Content-Type": "application/xml" });
     res.end(xml);
     return;
   }
-  if (req.method === "GET" && req.url === `/${backupName}`) {
-    const buf = readFileSync(archivePath);
+  if (req.method === "GET" && (req.url === `/${backupName}` || req.url === `/${evilBackupName}`)) {
+    const buf = readFileSync(req.url === `/${backupName}` ? archivePath : evilArchivePath);
     res.writeHead(200, { "Content-Type": "application/gzip" });
     res.end(buf);
     return;
@@ -220,6 +256,7 @@ await handler({}, mockCtx);
 
 // ── Assertions ───────────────────────────────────────────────────────────
 console.log("flow:");
+const realWebSearchExistedBefore = existsSync(join(homedir(), ".pi", "web-search.json"));
 const confirmText = confirmMessages.find((m) => m.includes("Confirm Restore")) || "";
 check("confirm dialog shown", confirmText.length > 0);
 check("preview lists config files incl. mcp.json + pi-fff.json",
@@ -229,7 +266,13 @@ check("preview shows rebase plan", confirmText.includes("/home/alice/ai-guard-ev
 check("preview warns about loopback provider",
   confirmText.includes("models.providers.magpie.baseUrl") && confirmText.includes("127.0.0.1:3425"));
 check("preview warns about plugin-config path (report-only)",
-  confirmText.includes("pi-fff.json:toolPath"));
+  confirmText.includes("pi-fff.json.toolPath"));
+check("preview warns about array-of-paths (scalar leaf)",
+  confirmText.includes("pi-fff.json.paths[0]"));
+check("preview lists unauthorized files as skipped",
+  confirmText.includes("Skipped (not authorized on this profile)") && confirmText.includes("mcp-auth.json") && confirmText.includes("rogue.json"));
+check("preview lists agent-config files",
+  confirmText.includes("Agent config files to restore") && confirmText.includes("AGENTS.md"));
 
 console.log("applied files:");
 const restoredSettings = JSON.parse(readFileSync(join(targetAgentDir, "settings.json"), "utf-8"));
@@ -257,6 +300,13 @@ const restoredFff = JSON.parse(readFileSync(join(targetAgentDir, "pi-fff.json"),
 check("pi-fff.json restored verbatim (report-only)", restoredFff.toolPath === "/home/alice/tools/t.sh");
 
 check("manifest.json NOT restored into agent dir", !existsSync(join(targetAgentDir, "manifest.json")));
+check("mcp-auth.json NOT restored (unauthorized)", !existsSync(join(targetAgentDir, "mcp-auth.json")));
+check("rogue.json NOT restored (unauthorized)", !existsSync(join(targetAgentDir, "rogue.json")));
+check("agent-config AGENTS.md restored", readFileSync(join(targetAgentDir, "AGENTS.md"), "utf-8").includes("agents"));
+check("agent-config pi-blackhole config restored",
+  existsSync(join(targetAgentDir, "pi-blackhole", "pi-blackhole-config.json")));
+check("real ~/.pi/web-search.json untouched by the test",
+  existsSync(join(homedir(), ".pi", "web-search.json")) === realWebSearchExistedBefore);
 check("sync_config.json untouched", existsSync(join(targetAgentDir, "sync_config.json")));
 check("skills restored", readFileSync(join(targetAgentDir, "skills", "hello", "SKILL.md"), "utf-8").includes("hello"));
 check("extensions restored", existsSync(join(targetAgentDir, "extensions", "shellkeeper-guard", "index.ts")));
@@ -268,6 +318,50 @@ check("report includes Path portability section", report.includes("Path portabil
 check("report includes rebase lines", report.includes("settings.extensions[0]"));
 check("report includes packages diff (+ npm:pi-markdown-preview)", report.includes("+ npm:pi-markdown-preview"));
 check("report includes missing-path warning", report.includes("missing") || report.includes("does not exist"));
+
+// ── Adversarial phase: symlink member must be rejected BEFORE extraction ──
+console.log("adversarial (symlink member):");
+{
+  const notificationsBefore = notifications.length;
+  const settingsBefore = readFileSync(join(targetAgentDir, "settings.json"), "utf-8");
+  const agentDirBefore = readdirSync(targetAgentDir).sort().join(",");
+  selectQueue.length = 0;
+  confirmMessages.length = 0;
+  selectQueue.push("Download Backup", evilBackupName, "Exit");
+  await handler({}, mockCtx);
+
+  const errNotify = notifications.slice(notificationsBefore).join("\n");
+  check("restore failed with an error notification", errNotify.includes("Restore failed"));
+  console.log("    (error: " + errNotify.split("\n").find((l) => l.includes("Restore failed"))?.slice(0, 160) + ")");
+  check("rejection mentions non-plain member", errNotify.includes("not a plain file/directory") || errNotify.includes("symbolic link") || errNotify.includes("Archive member"));
+  check("sentinel dir untouched", readdirSync(sentinelDir).length === 0);
+  check("target agent dir untouched by adversarial archive",
+    readdirSync(targetAgentDir).sort().join(",") === agentDirBefore);
+  check("settings.json unchanged by adversarial archive",
+    readFileSync(join(targetAgentDir, "settings.json"), "utf-8") === settingsBefore);
+}
+
+// ── Cancellation phase: declining the confirm leaves everything unchanged ─
+console.log("cancellation:");
+{
+  const settingsBefore = readFileSync(join(targetAgentDir, "settings.json"), "utf-8");
+  const agentDirBefore = readdirSync(targetAgentDir).sort().join(",");
+  selectQueue.length = 0;
+  confirmMessages.length = 0;
+  // confirm returns FALSE this time
+  const origConfirm = mockCtx.ui.confirm;
+  mockCtx.ui.confirm = async (title, message) => { confirmMessages.push(`${title}\n${message}`); return false; };
+  selectQueue.push("Download Backup", backupName, "Exit");
+  await handler({}, mockCtx);
+  mockCtx.ui.confirm = origConfirm;
+
+  check("confirm dialog was shown", confirmMessages.some((m) => m.includes("Confirm Restore")));
+  check("cancelled notification shown", notifications.slice(-3).join(" ").includes("cancelled"));
+  check("target agent dir unchanged after cancel",
+    readdirSync(targetAgentDir).sort().join(",") === agentDirBefore);
+  check("settings.json unchanged after cancel",
+    readFileSync(join(targetAgentDir, "settings.json"), "utf-8") === settingsBefore);
+}
 
 // ── Upload phase: pack the target agent dir and inspect the archive ─────
 console.log("upload:");
@@ -290,6 +384,9 @@ if (uploads.length === 1) {
   check("archive contains extra config pi-fff.json", listOut.includes("config/pi-fff.json"));
   check("archive contains settings/models/auth", listOut.includes("config/settings.json") && listOut.includes("config/models.json") && listOut.includes("config/auth.json"));
   check("archive contains skills + extensions", listOut.includes("skills/") && listOut.includes("extensions/"));
+  check("archive contains agent-config AGENTS.md", listOut.includes("agent-config/agent/AGENTS.md"));
+  check("archive contains agent-config pi-blackhole", listOut.includes("pi-blackhole-config.json"));
+  check("mcp.json NOT duplicated under agent-config", !listOut.includes("agent-config/agent/mcp.json"));
 
   // Extract and inspect the manifest
   const upStage = join(workDir, "up-stage");

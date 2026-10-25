@@ -125,16 +125,29 @@ function normalizeZipName(name: string): string {
   return n;
 }
 
+/** Security-relevant extraction rejection — callers must NOT fall back to
+ *  external extractors after this error, or the rejection can be bypassed. */
+export class ZipSecurityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ZipSecurityError";
+  }
+}
+
+export function isZipSecurityError(e: unknown): boolean {
+  return e instanceof ZipSecurityError || (e instanceof Error && e.name === "ZipSecurityError");
+}
+
 function safeDestPath(destDir: string, entryName: string): string | null {
   const n = normalizeZipName(entryName);
   if (!n || n.endsWith("/")) return null; // directory marker
   if (n.includes("..") || path.isAbsolute(n) || /^[a-zA-Z]:/.test(n)) {
-    throw new Error(`Unsafe zip path rejected: ${entryName}`);
+    throw new ZipSecurityError(`Unsafe zip path rejected: ${entryName}`);
   }
   const full = path.resolve(destDir, n);
   const root = path.resolve(destDir) + path.sep;
   if (full !== path.resolve(destDir) && !full.startsWith(root)) {
-    throw new Error(`Zip path escapes destination: ${entryName}`);
+    throw new ZipSecurityError(`Zip path escapes destination: ${entryName}`);
   }
   return full;
 }
