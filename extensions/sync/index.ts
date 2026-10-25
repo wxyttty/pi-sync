@@ -4,6 +4,22 @@ import * as path from "node:path";
 import * as os from "node:os";
 
 import { timestampForBackup, ensureDir, writeJsonAtomic, readJsonSafe } from "../_shared/json-io";
+import { getAgentDir } from "../_shared/agent-dirs";
+import {
+  CORE_CONFIG_FILES,
+  RESERVED_CONFIG_FILES,
+  SAFE_CONFIG_NAME_RE,
+  validateArchiveEntries,
+} from "../_shared/archive-rules";
+import {
+  classifyUrl,
+  parseManifest,
+  rebaseConfigFile,
+  rebaseContextFromManifest,
+  type PathRebase,
+  type PortabilityWarning,
+  type SyncManifest,
+} from "../_shared/path-portability";
 import { enhancedSelect } from "../_shared/enhanced-select";
 import { runCommand } from "../_shared/spawn";
 import { fetchWithTimeout } from "../_shared/fetch-utils";
@@ -73,9 +89,12 @@ function yieldToUI(): Promise<void> {
 }
 
 // Default settings file to store user configuration
-const SYNC_CONFIG_PATH = path.join(os.homedir(), ".pi", "agent", "sync_config.json");
+const SYNC_CONFIG_PATH = path.join(getAgentDir(), "sync_config.json");
 const TAR_TIMEOUT_MS = 300_000;
 const CLOUD_FETCH_TIMEOUT_MS = 120_000;
+
+/** pi-sync version stamped into backup manifests. */
+const PI_SYNC_VERSION = "1.4.0";
 
 type SyncBackend = "webdav" | "s3";
 
@@ -105,8 +124,11 @@ interface SyncConfig {
   backupProviders: boolean;
   backupSkills: boolean;
   backupExtensions: boolean;
-  /** Agent-level config: ~/.pi/web-search.json, ~/.pi/agent/{mcp.json,AGENTS.md}, ~/.pi/agent/pi-blackhole/pi-blackhole-config.json */
-  backupAgentConfig: boolean;
+  /**
+   * Explicit allowlist of extra agent-root config files to sync (plugin
+   * configs like pi-fff.json). Empty by default — discovery is opt-in.
+   */
+  extraConfigFiles: string[];
 }
 
 /** Multi-profile store written to sync_config.json (v2). */
@@ -136,8 +158,23 @@ function defaultConfig(name = "default"): SyncConfig {
     backupProviders: true,
     backupSkills: true,
     backupExtensions: true,
-    backupAgentConfig: true,
+    extraConfigFiles: [],
   };
+}
+
+/** Sanitize the extra-config allowlist: plain *.json names, no reserved/core files. */
+function sanitizeExtraConfigFiles(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const v of raw) {
+    if (typeof v !== "string") continue;
+    const name = path.basename(v.trim().replace(/\\/g, "/"));
+    if (!SAFE_CONFIG_NAME_RE.test(name)) continue;
+    if (RESERVED_CONFIG_FILES.has(name.toLowerCase())) continue;
+    if ((CORE_CONFIG_FILES as string[]).includes(name)) continue;
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
 }
 
 function normalizePrefix(prefix: string): string {
@@ -185,7 +222,7 @@ function normalizeConfig(data: Partial<SyncConfig> | undefined, fallbackName?: s
     backupProviders: d.backupProviders !== false,
     backupSkills: d.backupSkills !== false,
     backupExtensions: d.backupExtensions !== false,
-    backupAgentConfig: d.backupAgentConfig !== false,
+    extraConfigFiles: sanitizeExtraConfigFiles(d.extraConfigFiles),
   };
 }
 
@@ -496,9 +533,17 @@ export default function (pi: ExtensionAPI) {
 
 
   function readSettingsPackages(): string[] {
-    const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
-    const data = readJsonSafe<{ packages?: string[] }>(settingsPath, {});
-    return Array.isArray(data.packages) ? data.packages.map(String) : [];
+    const settingsPath = path.join(getAgentDir(), "settings.json");
+    const data = readJsonSafe<{ packages?: unknown[] }>(settingsPath, {});
+    if (!Array.isArray(data.packages)) return [];
+    // Packages may be strings or { source, … } objects — normalize for diffing.
+    return data.packages.map((p) => {
+      if (typeof p === "string") return p;
+      if (p !== null && typeof p === "object" && typeof (p as { source?: unknown }).source === "string") {
+        return (p as { source: string }).source;
+      }
+      return JSON.stringify(p);
+    });
   }
 
   function diffStringLists(before: string[], after: string[]): { added: string[]; removed: string[] } {
@@ -516,6 +561,7 @@ export default function (pi: ExtensionAPI) {
     safetyBackups: string[];
     packagesBefore: string[];
     packagesAfter: string[];
+    portabilityLines: string[];
   }): string {
     const lines: string[] = [];
     lines.push(`Backup: ${opts.backupName}`);
@@ -535,6 +581,12 @@ export default function (pi: ExtensionAPI) {
       for (const x of pkgDiff.added) lines.push(`  + ${x}`);
       for (const x of pkgDiff.removed) lines.push(`  - ${x}`);
     }
+
+    if (opts.portabilityLines.length > 0) {
+      lines.push("── Path portability ──");
+      for (const l of opts.portabilityLines) lines.push(`  ${l}`);
+    }
+
     lines.push("── Next ──");
     lines.push("  Reload runtime (or restart Pi) to apply skills/extensions/packages.");
     lines.push("  Device-local providers (127.0.0.1) and provider-proxy ports may need this machine.");
@@ -552,105 +604,278 @@ export default function (pi: ExtensionAPI) {
   }
 
 
-  function validateArchiveEntries(entries: string[]): void {
-    const allowedTopLevel = new Set(["config", "skills", "extensions", "agent-config"]);
-    const allowedConfigFiles = new Set(["models.json", "settings.json", "auth.json"]);
-    // agent-config/ 下白名单：web-search.json 与 agent/ 子树（路径自描述，不再枚举）
-    const allowedAgentConfigTop = new Set(["web-search.json", "agent"]);
-    // agent-config/agent/ 下白名单：mcp.json、AGENTS.md、pi-blackhole/ 子树
-    const allowedAgentConfigAgent = new Set(["mcp.json", "AGENTS.md", "pi-blackhole"]);
-    // agent-config/agent/pi-blackhole/ 下仅允许 pi-blackhole-config.json
-    const allowedAgentConfigBlackhole = new Set(["pi-blackhole-config.json"]);
+  // ── Staged restore: inspect → preview → apply ─────────────────────
 
-    // Ignore empty / root-only noise left after normalizing "./"
-    const meaningful = entries.filter((e) => e && e !== "." && e !== "./");
+  interface StagedConfigFile {
+    name: string;
+    /** True when the file parsed as JSON. */
+    isJson: boolean;
+    /** Parsed JSON value (as-is). */
+    parsed: unknown;
+    /** Rebased value (differs from parsed only when rebases exist). */
+    value: unknown;
+    rebases: PathRebase[];
+    warnings: PortabilityWarning[];
+  }
 
-    if (meaningful.length === 0) {
-      throw new Error("Backup archive is empty or unreadable");
-    }
+  interface StagedRestore {
+    stageDir: string;
+    /** null = legacy archive without manifest (verbatim restore). */
+    manifest: SyncManifest | null;
+    configFiles: StagedConfigFile[];
+    hasSkills: boolean;
+    hasExtensions: boolean;
+    entries: string[];
+  }
 
-    for (const entry of meaningful) {
-      const pathParts = entry.split("/").filter(Boolean);
-      if (entry.startsWith("/") || /^[a-zA-Z]:\//.test(entry) || pathParts.includes("..")) {
-        throw new Error(`Unsafe archive path rejected: ${entry}`);
-      }
-
-      const [topLevel, secondPart, thirdPart, fourthPart] = pathParts;
-      if (!topLevel || !allowedTopLevel.has(topLevel)) {
-        throw new Error(`Unexpected top-level archive entry rejected: ${entry}`);
-      }
-
-      if (topLevel === "config" && secondPart && !allowedConfigFiles.has(secondPart)) {
-        throw new Error(`Unexpected config file rejected: ${entry}`);
-      }
-
-      // agent-config/ 路径白名单
-      if (topLevel === "agent-config") {
-        if (!secondPart) {
-          throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
+  /** Reject symbolic links anywhere in the staged tree (tar members can carry them). */
+  function assertNoSymlinks(dir: string): void {
+    const stack: string[] = [dir];
+    while (stack.length > 0) {
+      const cur = stack.pop();
+      if (!cur) break;
+      for (const name of fs.readdirSync(cur)) {
+        const p = path.join(cur, name);
+        const st = fs.lstatSync(p);
+        if (st.isSymbolicLink()) {
+          throw new Error(`Archive contains a symbolic link; rejected: ${path.relative(dir, p)}`);
         }
-        if (!allowedAgentConfigTop.has(secondPart)) {
-          throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
-        }
-        // agent-config/web-search.json：必须是文件，不能再有下级
-        if (secondPart === "web-search.json" && thirdPart) {
-          throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
-        }
-        // agent-config/agent/ 下级白名单
-        if (secondPart === "agent") {
-          if (!thirdPart) {
-            throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
-          }
-          if (!allowedAgentConfigAgent.has(thirdPart)) {
-            throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
-          }
-          // agent-config/agent/{mcp.json,AGENTS.md}：必须是文件，不能再有下级
-          if ((thirdPart === "mcp.json" || thirdPart === "AGENTS.md") && fourthPart) {
-            throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
-          }
-          // agent-config/agent/pi-blackhole/ 下级白名单：仅 pi-blackhole-config.json
-          if (thirdPart === "pi-blackhole") {
-            if (!fourthPart) {
-              throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
-            }
-            if (!allowedAgentConfigBlackhole.has(fourthPart)) {
-              throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
-            }
-            // pi-blackhole-config.json 不能再有下级
-            if (pathParts.length > 5) {
-              throw new Error(`Unexpected agent-config entry rejected: ${entry}`);
-            }
-          }
-        }
+        if (st.isDirectory()) stack.push(p);
       }
     }
   }
 
-  function getRestorePlan(entries: string[], config: SyncConfig): string[] {
-    const hasConfig = entries.some((entry) => entry === "config" || entry.startsWith("config/"));
-    const hasSkills = entries.some((entry) => entry === "skills" || entry.startsWith("skills/"));
-    const hasExtensions = entries.some((entry) => entry === "extensions" || entry.startsWith("extensions/"));
-    const hasAgentConfig = entries.some((entry) => entry === "agent-config" || entry.startsWith("agent-config/"));
-    const plan: string[] = [];
+  /** Report-only scan for legacy archives (no manifest): loopback URLs + home-ish absolute paths. */
+  function scanLegacyWarnings(fileName: string, obj: unknown): PortabilityWarning[] {
+    const warnings: PortabilityWarning[] = [];
+    const HOME_ISH_RE = /^(\/home\/[^/]+\/|\/Users\/[^/]+\/|[A-Za-z]:[\\\/]Users[\\\/])/;
+    const walk = (node: unknown, prefix: string, depth: number): void => {
+      if (depth > 12 || node === null || typeof node !== "object") return;
+      if (Array.isArray(node)) {
+        node.forEach((v, i) => walk(v, `${prefix}[${i}]`, depth + 1));
+        return;
+      }
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        const field = `${fileName}:${prefix}${prefix ? "." : ""}${k}`;
+        if (typeof v === "string") {
+          const cls = classifyUrl(v);
+          if (cls === "loopback" || cls === "private") {
+            warnings.push({
+              field,
+              value: v,
+              kind: cls === "loopback" ? "loopback-url" : "private-url",
+              hint: "device/LAN-local URL — may need a local service on this machine",
+            });
+          } else if (HOME_ISH_RE.test(v)) {
+            warnings.push({
+              field,
+              value: v.length > 120 ? v.slice(0, 117) + "…" : v,
+              kind: "unrebased-path",
+              hint: "legacy archive: absolute home path restored as-is",
+            });
+          }
+        } else if (v !== null && typeof v === "object") {
+          walk(v, `${prefix}${prefix ? "." : ""}${k}`, depth + 1);
+        }
+      }
+    };
+    walk(obj, "", 0);
+    return warnings;
+  }
 
-    if (hasConfig) {
-      plan.push(config.backupProviders ? "Config files will be overwritten; current files get timestamped .bak copies." : "Config files are present but skipped by current settings.");
+  /**
+   * Extract the archive into a staging dir, validate it, read the manifest,
+   * and compute path rebases — WITHOUT touching the agent dir.
+   * The confirm dialog then previews exactly what will be applied.
+   */
+  async function stageRestore(archivePath: string): Promise<StagedRestore> {
+    const stageDir = path.join(os.tmpdir(), `pi_sync_stage_${Date.now()}`);
+    fs.mkdirSync(stageDir, { recursive: true });
+    try {
+      const entries = await listArchiveEntries(archivePath);
+      validateArchiveEntries(entries);
+      await extractArchiveTo(archivePath, stageDir);
+      assertNoSymlinks(stageDir);
+
+      // Manifest (optional: legacy archives have none)
+      const manifestPath = path.join(stageDir, "manifest.json");
+      let manifest: SyncManifest | null = null;
+      if (fs.existsSync(manifestPath)) {
+        let raw: unknown;
+        try {
+          raw = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+        } catch (e) {
+          throw new Error(`manifest.json is not valid JSON: ${formatError(e)}`);
+        }
+        manifest = parseManifest(raw); // throws on malformed/unsupported
+      }
+
+      const ctx = manifest
+        ? rebaseContextFromManifest(manifest, os.homedir(), getAgentDir(), (p) => {
+            try {
+              return fs.existsSync(p);
+            } catch {
+              return false;
+            }
+          })
+        : null;
+
+      const configFiles: StagedConfigFile[] = [];
+      const configSrc = path.join(stageDir, "config");
+      if (fs.existsSync(configSrc)) {
+        for (const name of fs.readdirSync(configSrc).sort()) {
+          const src = path.join(configSrc, name);
+          if (!fs.statSync(src).isFile()) continue;
+          let parsed: unknown = undefined;
+          let isJson = false;
+          try {
+            parsed = JSON.parse(fs.readFileSync(src, "utf-8"));
+            isJson = true;
+          } catch {
+            // not JSON — restored verbatim
+          }
+          let value = parsed;
+          let rebases: PathRebase[] = [];
+          let warnings: PortabilityWarning[] = [];
+          if (isJson && ctx) {
+            const r = rebaseConfigFile(name, parsed, ctx);
+            value = r.value;
+            rebases = r.rebases;
+            warnings = r.warnings;
+          } else if (isJson) {
+            warnings = scanLegacyWarnings(name, parsed);
+          }
+          configFiles.push({ name, isJson, parsed, value, rebases, warnings });
+        }
+      }
+
+      return {
+        stageDir,
+        manifest,
+        configFiles,
+        hasSkills: fs.existsSync(path.join(stageDir, "skills")),
+        hasExtensions: fs.existsSync(path.join(stageDir, "extensions")),
+        entries,
+      };
+    } catch (e) {
+      try {
+        fs.rmSync(stageDir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+      throw e;
     }
-    if (hasSkills) {
-      plan.push(config.backupSkills ? "Skills directory will be replaced; current skills get a timestamped backup folder." : "Skills are present but skipped by current settings.");
+  }
+
+  /** Human-readable preview lines for the confirm dialog (and the report). */
+  function buildRestorePreview(staged: StagedRestore, config: SyncConfig): string[] {
+    const lines: string[] = [];
+    const cfgNames = staged.configFiles.map((f) => f.name);
+    if (cfgNames.length > 0 || config.backupProviders) {
+      lines.push(
+        config.backupProviders
+          ? `Config files to restore (${cfgNames.length}): ${cfgNames.join(", ") || "—"}`
+          : `Config files present but skipped by settings (${cfgNames.join(", ") || "—"})`,
+      );
     }
-    if (hasExtensions) {
-      plan.push(config.backupExtensions ? "Extensions will be merged/overwritten; current extensions get a timestamped backup folder." : "Extensions are present but skipped by current settings.");
+    if (staged.hasSkills) {
+      lines.push(config.backupSkills ? "Skills directory will be replaced; current skills get a timestamped backup folder." : "Skills are present but skipped by current settings.");
     }
-    if (hasAgentConfig) {
-      plan.push(config.backupAgentConfig ? "Agent config (web-search.json, mcp.json, AGENTS.md, pi-blackhole-config.json) will be overwritten; current files get timestamped .bak copies." : "Agent config is present but skipped by current settings.");
+    if (staged.hasExtensions) {
+      lines.push(config.backupExtensions ? "Extensions will be merged/overwritten; current extensions get a timestamped backup folder." : "Extensions are present but skipped by current settings.");
     }
 
-    if (plan.length === 0) {
-      plan.push("No restorable config, skills, or extensions found in this archive.");
+    lines.push("── Path portability ──");
+    if (!staged.manifest) {
+      lines.push("⚠ Legacy archive (no manifest): paths restored verbatim — review config paths manually.");
+    } else {
+      const src = staged.manifest.source;
+      lines.push(`Source: ${src.platformTag} · home ${src.home}`);
+      const rebases = staged.configFiles.flatMap((f) => f.rebases);
+      if (rebases.length === 0) {
+        lines.push("No paths need rebasing.");
+      } else {
+        lines.push(`Paths rebased to this machine (${rebases.length}):`);
+        for (const r of rebases.slice(0, 15)) {
+          lines.push(`  • ${r.field}: ${r.from} → ${r.to}${r.exists ? "" : "  (missing here)"}`);
+        }
+        if (rebases.length > 15) lines.push(`  … +${rebases.length - 15} more`);
+      }
     }
 
-    return plan;
+    const warnings = staged.configFiles.flatMap((f) => f.warnings);
+    if (warnings.length > 0) {
+      lines.push(`Warnings (${warnings.length}):`);
+      for (const w of warnings.slice(0, 15)) {
+        lines.push(`  • ${w.field}: ${w.value} — ${w.hint}`);
+      }
+      if (warnings.length > 15) lines.push(`  … +${warnings.length - 15} more`);
+    }
+
+    if (lines.length === 0) {
+      lines.push("No restorable config, skills, or extensions found in this archive.");
+    }
+    return lines;
+  }
+
+  /** Apply the exact staged (and previewed) result into the agent dir. */
+  async function applyStagedRestore(
+    staged: StagedRestore,
+    config: SyncConfig,
+  ): Promise<{ restored: string[]; safetyBackups: string[] }> {
+    const agentDir = getAgentDir();
+    const restored: string[] = [];
+    const safetyBackups: string[] = [];
+
+    if (staged.configFiles.length > 0 && config.backupProviders) {
+      for (const f of staged.configFiles) {
+        const destFile = path.join(agentDir, f.name);
+        if (fs.existsSync(destFile)) {
+          const bakPath = `${destFile}.bak-${timestampForBackup()}`;
+          fs.copyFileSync(destFile, bakPath);
+          safetyBackups.push(bakPath);
+        }
+        if (f.isJson && f.rebases.length > 0) {
+          // Write the rebased JSON exactly as previewed.
+          fs.writeFileSync(destFile, JSON.stringify(f.value, null, 2) + "\n", "utf-8");
+        } else {
+          fs.copyFileSync(path.join(staged.stageDir, "config", f.name), destFile);
+        }
+        restored.push(`Config: ${f.name}`);
+      }
+    }
+
+    const skillsSrc = path.join(staged.stageDir, "skills");
+    if (staged.hasSkills && config.backupSkills) {
+      const skillsDest = path.join(agentDir, "skills");
+      const skillsBackup = path.join(agentDir, `skills-backup-${timestampForBackup()}`);
+      if (fs.existsSync(skillsDest)) {
+        fs.renameSync(skillsDest, skillsBackup);
+        safetyBackups.push(skillsBackup);
+      }
+
+      fs.mkdirSync(skillsDest, { recursive: true });
+      copyRecursiveSync(skillsSrc, skillsDest);
+      await yieldToUI();
+      restored.push(`Skills directory`);
+    }
+
+    const extSrc = path.join(staged.stageDir, "extensions");
+    if (staged.hasExtensions && config.backupExtensions) {
+      const extDest = path.join(agentDir, "extensions");
+      const extBackup = path.join(agentDir, `extensions-backup-${timestampForBackup()}`);
+      if (fs.existsSync(extDest)) {
+        fs.mkdirSync(extBackup, { recursive: true });
+        copyRecursiveSync(extDest, extBackup);
+        safetyBackups.push(extBackup);
+      }
+
+      copyRecursiveSync(extSrc, extDest);
+      await yieldToUI();
+      restored.push(`Extensions directory (merged)`);
+    }
+
+    return { restored, safetyBackups };
   }
 
   // ── Cloud backends ──────────────────────────────────────────────────
@@ -964,7 +1189,7 @@ export default function (pi: ExtensionAPI) {
   // ── Zip create / extract ────────────────────────────────────────────
 
   async function createZip(config: SyncConfig, tempZipPath: string): Promise<string[]> {
-    const agentDir = path.join(os.homedir(), ".pi", "agent");
+    const agentDir = getAgentDir();
     const tempDir = path.join(os.tmpdir(), `pi_sync_temp_${Date.now()}`);
     fs.mkdirSync(tempDir, { recursive: true });
 
@@ -972,7 +1197,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       if (config.backupProviders) {
-        const filesToBackup = ["models.json", "settings.json", "auth.json"];
+        const filesToBackup = [...CORE_CONFIG_FILES, ...config.extraConfigFiles];
         const confDir = path.join(tempDir, "config");
         fs.mkdirSync(confDir, { recursive: true });
         for (const file of filesToBackup) {
@@ -1011,146 +1236,31 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      if (config.backupAgentConfig) {
-        const piHome = path.join(os.homedir(), ".pi");
-        const acDest = path.join(tempDir, "agent-config");
-        const acAgentDest = path.join(acDest, "agent");
-        const acBlackholeDest = path.join(acAgentDest, "pi-blackhole");
-        const agentFiles = [
-          { src: path.join(piHome, "web-search.json"), dest: path.join(acDest, "web-search.json"), label: "Agent Config: web-search.json" },
-          { src: path.join(agentDir, "mcp.json"), dest: path.join(acAgentDest, "mcp.json"), label: "Agent Config: mcp.json" },
-          { src: path.join(agentDir, "AGENTS.md"), dest: path.join(acAgentDest, "AGENTS.md"), label: "Agent Config: AGENTS.md" },
-          { src: path.join(agentDir, "pi-blackhole", "pi-blackhole-config.json"), dest: path.join(acBlackholeDest, "pi-blackhole-config.json"), label: "Agent Config: pi-blackhole-config.json" },
-        ];
-        let anyAgentConfigAdded = false;
-        for (const { src, dest, label } of agentFiles) {
-          if (fs.existsSync(src)) {
-            fs.mkdirSync(path.dirname(dest), { recursive: true });
-            fs.copyFileSync(src, dest);
-            contents.push(label);
-            anyAgentConfigAdded = true;
-          }
-        }
-        if (anyAgentConfigAdded) {
-          await yieldToUI();
-        }
-      }
-
       if (contents.length === 0) {
         throw new Error("No components selected or found to backup!");
       }
 
+      // Manifest: source-machine identity for cross-system path rebasing.
+      const manifest: SyncManifest = {
+        version: 1,
+        piSyncVersion: PI_SYNC_VERSION,
+        createdAt: new Date().toISOString(),
+        source: {
+          platform: os.platform(),
+          platformTag: platformTag(),
+          home: os.homedir(),
+          agentDir,
+        },
+      };
+      fs.writeFileSync(
+        path.join(tempDir, "manifest.json"),
+        JSON.stringify(manifest, null, 2) + "\n",
+        "utf-8",
+      );
+
       await yieldToUI();
       await runTar(["-c", "-z", "-f", tempZipPath, "-C", tempDir, "."]);
       return contents;
-    } finally {
-      try {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  async function extractZip(zipPath: string, config: SyncConfig): Promise<{ restored: string[]; safetyBackups: string[] }> {
-    const agentDir = path.join(os.homedir(), ".pi", "agent");
-    const tempDir = path.join(os.tmpdir(), `pi_sync_extract_${Date.now()}`);
-    fs.mkdirSync(tempDir, { recursive: true });
-
-    const restored: string[] = [];
-    const safetyBackups: string[] = [];
-
-    try {
-      const entries = await listArchiveEntries(zipPath);
-      validateArchiveEntries(entries);
-      await extractArchiveTo(zipPath, tempDir);
-
-      const configSrc = path.join(tempDir, "config");
-      if (fs.existsSync(configSrc) && config.backupProviders) {
-        const files = fs.readdirSync(configSrc);
-        for (const file of files) {
-          const srcFile = path.join(configSrc, file);
-          const destFile = path.join(agentDir, file);
-
-          if (fs.existsSync(destFile)) {
-            const bakPath = `${destFile}.bak-${timestampForBackup()}`;
-            fs.copyFileSync(destFile, bakPath);
-            safetyBackups.push(bakPath);
-          }
-          fs.copyFileSync(srcFile, destFile);
-          restored.push(`Config: ${file}`);
-        }
-      }
-
-      const skillsSrc = path.join(tempDir, "skills");
-      if (fs.existsSync(skillsSrc) && config.backupSkills) {
-        const skillsDest = path.join(agentDir, "skills");
-        const skillsBackup = path.join(agentDir, `skills-backup-${timestampForBackup()}`);
-        if (fs.existsSync(skillsDest)) {
-          fs.renameSync(skillsDest, skillsBackup);
-          safetyBackups.push(skillsBackup);
-        }
-
-        fs.mkdirSync(skillsDest, { recursive: true });
-        copyRecursiveSync(skillsSrc, skillsDest);
-        await yieldToUI();
-        restored.push(`Skills directory`);
-      }
-
-      const extSrc = path.join(tempDir, "extensions");
-      if (fs.existsSync(extSrc) && config.backupExtensions) {
-        const extDest = path.join(agentDir, "extensions");
-        const extBackup = path.join(agentDir, `extensions-backup-${timestampForBackup()}`);
-        if (fs.existsSync(extDest)) {
-          fs.mkdirSync(extBackup, { recursive: true });
-          copyRecursiveSync(extDest, extBackup);
-          safetyBackups.push(extBackup);
-        }
-
-        copyRecursiveSync(extSrc, extDest);
-        await yieldToUI();
-        restored.push(`Extensions directory (merged)`);
-      }
-
-      // Agent config: ~/.pi/web-search.json, ~/.pi/agent/{mcp.json,AGENTS.md},
-      // ~/.pi/agent/pi-blackhole/pi-blackhole-config.json。
-      // archive 内是 agent-config/{web-search.json, agent/{mcp.json,AGENTS.md,pi-blackhole/pi-blackhole-config.json}}
-      // 整体路径与 ~/.pi/ 结构一致，逐文件恢复，已存在 → .bak-{ts}
-      const acSrc = path.join(tempDir, "agent-config");
-      if (fs.existsSync(acSrc) && config.backupAgentConfig) {
-        const piHome = path.join(os.homedir(), ".pi");
-        const acFiles: Array<{ src: string; dest: string; label: string }> = [];
-        const wsSrc = path.join(acSrc, "web-search.json");
-        if (fs.existsSync(wsSrc)) {
-          acFiles.push({ src: wsSrc, dest: path.join(piHome, "web-search.json"), label: "Agent Config: web-search.json" });
-        }
-        const acAgentSrc = path.join(acSrc, "agent");
-        const mcpSrc = path.join(acAgentSrc, "mcp.json");
-        if (fs.existsSync(mcpSrc)) {
-          acFiles.push({ src: mcpSrc, dest: path.join(agentDir, "mcp.json"), label: "Agent Config: mcp.json" });
-        }
-        const agentsMdSrc = path.join(acAgentSrc, "AGENTS.md");
-        if (fs.existsSync(agentsMdSrc)) {
-          acFiles.push({ src: agentsMdSrc, dest: path.join(agentDir, "AGENTS.md"), label: "Agent Config: AGENTS.md" });
-        }
-        const bhSrc = path.join(acAgentSrc, "pi-blackhole", "pi-blackhole-config.json");
-        if (fs.existsSync(bhSrc)) {
-          acFiles.push({ src: bhSrc, dest: path.join(agentDir, "pi-blackhole", "pi-blackhole-config.json"), label: "Agent Config: pi-blackhole-config.json" });
-        }
-        for (const { src, dest, label } of acFiles) {
-          if (fs.existsSync(dest)) {
-            const bakPath = `${dest}.bak-${timestampForBackup()}`;
-            fs.copyFileSync(dest, bakPath);
-            safetyBackups.push(bakPath);
-          }
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.copyFileSync(src, dest);
-          restored.push(label);
-        }
-        await yieldToUI();
-      }
-
-      return { restored, safetyBackups };
     } finally {
       try {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1302,7 +1412,7 @@ export default function (pi: ExtensionAPI) {
         `Backup Providers & Config: ${cfgConfig.backupProviders ? "ON" : "OFF"}`,
         `Backup Skills: ${cfgConfig.backupSkills ? "ON" : "OFF"}`,
         `Backup Extensions: ${cfgConfig.backupExtensions ? "ON" : "OFF"}`,
-        `Backup Agent Config: ${cfgConfig.backupAgentConfig ? "ON" : "OFF"}`,
+        `Extra config files: ${cfgConfig.extraConfigFiles.length ? cfgConfig.extraConfigFiles.join(", ") : "(none)"}`,
         "───────────────",
         "s Save",
         "x Back",
@@ -1401,7 +1511,89 @@ export default function (pi: ExtensionAPI) {
       if (selected.startsWith("Backup Providers & Config:")) { cfgConfig.backupProviders = !cfgConfig.backupProviders; continue; }
       if (selected.startsWith("Backup Skills:")) { cfgConfig.backupSkills = !cfgConfig.backupSkills; continue; }
       if (selected.startsWith("Backup Extensions:")) { cfgConfig.backupExtensions = !cfgConfig.backupExtensions; continue; }
-      if (selected.startsWith("Backup Agent Config:")) { cfgConfig.backupAgentConfig = !cfgConfig.backupAgentConfig; continue; }
+      if (selected.startsWith("Extra config files:")) {
+        await showExtraConfigEditor(ctx, cfgConfig);
+        continue;
+      }
+    }
+  }
+
+  /** Editor for the extra-config allowlist: discovered agent-root *.json + manual add. */
+  async function showExtraConfigEditor(ctx: ExtensionCommandContext, cfg: SyncConfig): Promise<void> {
+    while (true) {
+      const selected = cfg.extraConfigFiles;
+      let candidates: string[] = [];
+      try {
+        candidates = fs
+          .readdirSync(getAgentDir())
+          .filter((name) => {
+            if (!name.endsWith(".json") || name.startsWith(".")) return false;
+            if (name.includes(".bak-")) return false;
+            if (RESERVED_CONFIG_FILES.has(name.toLowerCase())) return false;
+            if ((CORE_CONFIG_FILES as string[]).includes(name)) return false;
+            if (name === "models-store.json") return false; // cache, not config
+            return true;
+          })
+          .sort();
+      } catch {
+        // agent dir unreadable — manual add still works
+      }
+      const unselected = candidates.filter((c) => !selected.includes(c));
+
+      const items: string[] = [];
+      if (selected.length > 0) {
+        items.push("── Selected (will sync) ──");
+        for (const f of selected) items.push(`✓ ${f}`);
+      }
+      if (unselected.length > 0) {
+        items.push("── Discovered in agent dir ──");
+        for (const f of unselected) items.push(`○ ${f}`);
+      }
+      items.push(
+        "───────────────",
+        "+ Add file name manually",
+        "s Save",
+        "x Cancel",
+      );
+
+      const choice = await enhancedSelect(
+        ctx,
+        `Extra config files (${selected.length} selected) — plugin configs to sync`,
+        items,
+        { fuzzy: true },
+      );
+      if (!choice || choice === "x Cancel") return;
+      if (choice === "s Save") {
+        saveConfig(cfg);
+        ctx.ui.notify("Extra config files saved.", "info");
+        return;
+      }
+      if (choice === "+ Add file name manually") {
+        const val = await ctx.ui.input("Config file name (e.g. pi-fff.json):", "");
+        if (val) {
+          const name = path.basename(val.trim().replace(/\\/g, "/"));
+          if (
+            !SAFE_CONFIG_NAME_RE.test(name) ||
+            RESERVED_CONFIG_FILES.has(name.toLowerCase()) ||
+            (CORE_CONFIG_FILES as string[]).includes(name)
+          ) {
+            ctx.ui.notify(`"${name}" is reserved, core, or unsafe.`, "warning");
+          } else if (!cfg.extraConfigFiles.includes(name)) {
+            cfg.extraConfigFiles.push(name);
+          }
+        }
+        continue;
+      }
+      if (choice.startsWith("✓ ")) {
+        const name = choice.slice(2).trim();
+        cfg.extraConfigFiles = cfg.extraConfigFiles.filter((f) => f !== name);
+        continue;
+      }
+      if (choice.startsWith("○ ")) {
+        const name = choice.slice(2).trim();
+        if (!cfg.extraConfigFiles.includes(name)) cfg.extraConfigFiles.push(name);
+        continue;
+      }
     }
   }
 
@@ -1476,6 +1668,7 @@ export default function (pi: ExtensionAPI) {
       backupProviders: configs.some((c) => c.backupProviders),
       backupSkills: configs.some((c) => c.backupSkills),
       backupExtensions: configs.some((c) => c.backupExtensions),
+      extraConfigFiles: Array.from(new Set(configs.flatMap((c) => c.extraConfigFiles || []))),
     };
   }
 
@@ -1647,43 +1840,58 @@ export default function (pi: ExtensionAPI) {
 
         const archiveEntries = await listArchiveEntries(tempDownloadZip);
         validateArchiveEntries(archiveEntries);
-        const restorePlan = getRestorePlan(archiveEntries, dlConfig);
-        const confirmed = await ctx.ui.confirm(
-          "Confirm Restore After Inspection?",
-          [
-            `Backup: ${backupChoice}`,
-            `Profile: ${profileId}`,
-            `Backend: ${dlConfig.backend}`,
-            `Archive entries inspected: ${archiveEntries.length}`,
-            ...restorePlan,
-            "This can overwrite local configuration/skills/extensions, but existing local files/directories will receive timestamped backups first.",
-          ].join("\n"),
-        );
 
-        if (!confirmed) {
-          ctx.ui.notify("Restore cancelled after archive inspection.", "info");
-          return;
-        }
-
-        const packagesBefore = readSettingsPackages();
-        ctx.ui.notify("Extracting and restoring backup contents...", "info");
+        // Stage the restore: extract, read manifest, compute path rebases —
+        // nothing touches the agent dir until the user confirms.
+        ctx.ui.notify("Inspecting archive (staging restore plan)...", "info");
         await yieldToUI();
-        const { restored, safetyBackups } = await extractZip(tempDownloadZip, dlConfig);
-        const packagesAfter = readSettingsPackages();
-        const report = formatRestoreReport({
-          backupName: backupChoice,
-          restored,
-          safetyBackups,
-          packagesBefore,
-          packagesAfter,
-        });
-        ctx.ui.notify(`🎉 Restore finished\n${report}`, "info");
+        const staged = await stageRestore(tempDownloadZip);
+        try {
+          const preview = buildRestorePreview(staged, dlConfig);
+          const confirmed = await ctx.ui.confirm(
+            "Confirm Restore After Inspection?",
+            [
+              `Backup: ${backupChoice}`,
+              `Profile: ${profileId}`,
+              `Backend: ${dlConfig.backend}`,
+              `Archive entries inspected: ${archiveEntries.length}`,
+              ...preview,
+              "This can overwrite local configuration/skills/extensions, but existing local files/directories will receive timestamped backups first.",
+            ].join("\n"),
+          );
 
-        const doReload = await ctx.ui.confirm(
-          "Reload Runtime?",
-          "Reload the agent runtime now to apply restored skills, extensions, and packages?",
-        );
-        if (doReload) await ctx.reload();
+          if (!confirmed) {
+            ctx.ui.notify("Restore cancelled after archive inspection.", "info");
+            return;
+          }
+
+          const packagesBefore = readSettingsPackages();
+          ctx.ui.notify("Applying staged restore...", "info");
+          await yieldToUI();
+          const { restored, safetyBackups } = await applyStagedRestore(staged, dlConfig);
+          const packagesAfter = readSettingsPackages();
+          const report = formatRestoreReport({
+            backupName: backupChoice,
+            restored,
+            safetyBackups,
+            packagesBefore,
+            packagesAfter,
+            portabilityLines: preview.slice(preview.indexOf("── Path portability ──") + 1),
+          });
+          ctx.ui.notify(`🎉 Restore finished\n${report}`, "info");
+
+          const doReload = await ctx.ui.confirm(
+            "Reload Runtime?",
+            "Reload the agent runtime now to apply restored skills, extensions, and packages?",
+          );
+          if (doReload) await ctx.reload();
+        } finally {
+          try {
+            fs.rmSync(staged.stageDir, { recursive: true, force: true });
+          } catch {
+            // ignore
+          }
+        }
       } finally {
         if (fs.existsSync(tempDownloadZip)) {
           try { fs.unlinkSync(tempDownloadZip); } catch { /* ignore */ }

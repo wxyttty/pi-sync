@@ -21,6 +21,7 @@ async function load() {
     const require = createRequire(import.meta.url);
     // Try jiti from agent tree
     const jitiCandidates = [
+      join(process.env.USERPROFILE || process.env.HOME || "", ".pi/agent/install/releases", process.env.PI_RELEASE || "1.4.0", "node_modules/jiti/lib/jiti.cjs"),
       join(process.env.USERPROFILE || process.env.HOME || "", ".pi/agent/npm/node_modules/jiti/lib/jiti.cjs"),
       join(process.env.USERPROFILE || process.env.HOME || "", ".pi/agent/npm/node_modules/jiti/lib/index.js"),
     ];

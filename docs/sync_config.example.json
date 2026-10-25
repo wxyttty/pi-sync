@@ -18,7 +18,11 @@
       "s3ForcePathStyle": true,
       "backupProviders": true,
       "backupSkills": true,
-      "backupExtensions": true
+      "backupExtensions": true,
+      "extraConfigFiles": [
+        "pi-fff.json",
+        "open-tui.json"
+      ]
     },
     "r2-temp": {
       "name": "Cloudflare R2",
@@ -36,7 +40,8 @@
       "s3ForcePathStyle": true,
       "backupProviders": true,
       "backupSkills": true,
-      "backupExtensions": true
+      "backupExtensions": true,
+      "extraConfigFiles": []
     }
   }
 }

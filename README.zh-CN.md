@@ -25,7 +25,7 @@
 需要 [Pi coding agent](https://github.com/earendil-works/pi-coding-agent)，以及可用的 WebDAV（TeraCLOUD、坚果云、Nextcloud、ownCloud、自建等）。
 
 ```bash
-pi install git:github.com/BevalZ/pi-sync@v1.3.7
+pi install git:github.com/BevalZ/pi-sync@v1.4.0
 ```
 
 然后重启 Pi，或执行 `/reload`。
@@ -47,7 +47,7 @@ TUI 提示：`↵` 选择 · `↑↓` 导航 · `Esc` 取消。
 
 ```bash
 # 1. 安装
-pi install git:github.com/BevalZ/pi-sync@v1.3.7
+pi install git:github.com/BevalZ/pi-sync@v1.4.0
 
 # 2. 打开菜单（若尚未配置 WebDAV，会先进入设置向导）
 /sync
@@ -64,11 +64,26 @@ pi install git:github.com/BevalZ/pi-sync@v1.3.7
 
 | 组件 | 默认 | 说明 |
 |------|------|------|
-| Config | 开 | `models.json`、`settings.json`、`auth.json` |
+| Config | 开 | `models.json`、`settings.json`、`auth.json`、`mcp.json` |
+| 额外配置文件 | 关（白名单） | agent 目录根下的插件配置，如 `pi-fff.json` —— 在 **Configure Active Profile → Extra config files** 中挑选 |
 | Skills | 开 | 整个 `~/.pi/agent/skills` |
 | Extensions | 开 | `~/.pi/agent/extensions`（zip 中会排除 sync 插件自身） |
 
+`sync_config.json`（云端凭证）永远不会被打包或恢复。`mcp-auth.json`（OAuth 授权）默认也不同步 —— 只有在你清楚后果时才手动加入白名单。
+
 可在 **Configure Sync Settings** 中分别开关。
+
+### 跨系统路径适配
+
+v1.4.0+ 生成的备份带有 `manifest.json`，记录源主机的 home 与 agent 目录。恢复时：
+
+- **已知路径字段**（`settings.json` 的 `extensions` / `skills` / `prompts` / `themes` 资源、`sessionDir`、`shellPath`，以及 `mcp.json` 的 `command` / `cwd` / 整路径 `args`）中的绝对路径会被**重定位**到本机 home —— `/home/alice/…` → `/home/bob/…`，`C:\Users\wxy\…` → `/home/bob/…`，并自动转换分隔符。指向源 agent 目录内部的路径会重定位到本机 agent 目录（同样支持 `PI_CODING_AGENT_DIR`）。
+- 资源控制前缀（`!`、`+`、`-`）与非路径条目（`npm:…`、`git:…`、`builtin:…`、URL）原样保留。
+- 其余内容**只报告不改写**：恢复预览与报告会列出本机回环地址（`127.0.0.1` / `localhost`）、局域网地址（`192.168.x.x` 等）、本机不存在的绝对路径、以及内嵌源机器路径的命令 —— 附带 `models.providers.magpie.baseUrl` 这样的字段名，便于快速修复。
+- 完整的重定位/警告计划会在**确认恢复之前**展示；所见即所改（归档先解压到暂存区检查，确认前不会写入 agent 目录）。
+- 无 manifest 的旧版归档按原样恢复，并提示手动检查路径。manifest 损坏会让检查直接失败，而不是被静默忽略。
+
+白名单中的未知插件配置文件永远不会被改写 —— 只扫描、只报告。
 
 ### 备份文件名
 
@@ -82,9 +97,10 @@ pi_sync_backup_2026-07-14_20260714120000_windows11.zip
 
 ### 恢复时的安全机制
 
+- 归档先解压到暂存目录并检查（条目校验、拒绝符号链接、manifest、路径重定位），完整计划展示后才写入任何文件
 - 覆盖前，已有配置文件会生成带时间戳的 `.bak` 副本
 - 已有 skills / extensions 目录会先改名为 `*-backup-<timestamp>`，再替换/合并
-- 恢复前会展示计划，并要求确认
+- 恢复前会展示计划（含路径适配），并要求确认
 - 恢复成功后可选择 reload agent runtime，以应用 skills / extensions
 
 ## 新机引导（Windows，尚未安装 Pi）
@@ -179,7 +195,7 @@ pi-sync/
 需要 [Pi coding agent](https://github.com/earendil-works/pi-coding-agent)，以及可用的 WebDAV（TeraCLOUD、坚果云、Nextcloud、ownCloud、自建等）。
 
 ```bash
-pi install git:github.com/BevalZ/pi-sync@v1.3.7
+pi install git:github.com/BevalZ/pi-sync@v1.4.0
 ```
 
 然后重启 Pi，或执行 `/reload`。
@@ -201,7 +217,7 @@ TUI 提示：`↵` 选择 · `↑↓` 导航 · `Esc` 取消。
 
 ```bash
 # 1. 安装
-pi install git:github.com/BevalZ/pi-sync@v1.3.7
+pi install git:github.com/BevalZ/pi-sync@v1.4.0
 
 # 2. 打开菜单（若尚未配置 WebDAV，会先进入设置向导）
 /sync
@@ -218,11 +234,26 @@ pi install git:github.com/BevalZ/pi-sync@v1.3.7
 
 | 组件 | 默认 | 说明 |
 |------|------|------|
-| Config | 开 | `models.json`、`settings.json`、`auth.json` |
+| Config | 开 | `models.json`、`settings.json`、`auth.json`、`mcp.json` |
+| 额外配置文件 | 关（白名单） | agent 目录根下的插件配置，如 `pi-fff.json` —— 在 **Configure Active Profile → Extra config files** 中挑选 |
 | Skills | 开 | 整个 `~/.pi/agent/skills` |
 | Extensions | 开 | `~/.pi/agent/extensions`（zip 中会排除 sync 插件自身） |
 
+`sync_config.json`（云端凭证）永远不会被打包或恢复。`mcp-auth.json`（OAuth 授权）默认也不同步 —— 只有在你清楚后果时才手动加入白名单。
+
 可在 **Configure Sync Settings** 中分别开关。
+
+### 跨系统路径适配
+
+v1.4.0+ 生成的备份带有 `manifest.json`，记录源主机的 home 与 agent 目录。恢复时：
+
+- **已知路径字段**（`settings.json` 的 `extensions` / `skills` / `prompts` / `themes` 资源、`sessionDir`、`shellPath`，以及 `mcp.json` 的 `command` / `cwd` / 整路径 `args`）中的绝对路径会被**重定位**到本机 home —— `/home/alice/…` → `/home/bob/…`，`C:\Users\wxy\…` → `/home/bob/…`，并自动转换分隔符。指向源 agent 目录内部的路径会重定位到本机 agent 目录（同样支持 `PI_CODING_AGENT_DIR`）。
+- 资源控制前缀（`!`、`+`、`-`）与非路径条目（`npm:…`、`git:…`、`builtin:…`、URL）原样保留。
+- 其余内容**只报告不改写**：恢复预览与报告会列出本机回环地址（`127.0.0.1` / `localhost`）、局域网地址（`192.168.x.x` 等）、本机不存在的绝对路径、以及内嵌源机器路径的命令 —— 附带 `models.providers.magpie.baseUrl` 这样的字段名，便于快速修复。
+- 完整的重定位/警告计划会在**确认恢复之前**展示；所见即所改（归档先解压到暂存区检查，确认前不会写入 agent 目录）。
+- 无 manifest 的旧版归档按原样恢复，并提示手动检查路径。manifest 损坏会让检查直接失败，而不是被静默忽略。
+
+白名单中的未知插件配置文件永远不会被改写 —— 只扫描、只报告。
 
 ### 备份文件名
 
@@ -236,9 +267,10 @@ pi_sync_backup_2026-07-14_20260714120000_windows11.zip
 
 ### 恢复时的安全机制
 
+- 归档先解压到暂存目录并检查（条目校验、拒绝符号链接、manifest、路径重定位），完整计划展示后才写入任何文件
 - 覆盖前，已有配置文件会生成带时间戳的 `.bak` 副本
 - 已有 skills / extensions 目录会先改名为 `*-backup-<timestamp>`，再替换/合并
-- 恢复前会展示计划，并要求确认
+- 恢复前会展示计划（含路径适配），并要求确认
 - 恢复成功后可选择 reload agent runtime，以应用 skills / extensions
 
 ## 新机引导（Windows，尚未安装 Pi）
@@ -307,6 +339,17 @@ pi-sync/
 ```
 
 ## 更新日志
+
+### v1.4.0
+
+- **跨系统路径适配**：备份携带 `manifest.json`（源 home / agent 目录 / 平台）。恢复时，已知字段中的绝对路径（`settings.json` 资源、`sessionDir`、`shellPath`、`mcp.json` command/cwd/args）重定位到本机 —— 支持 Linux↔Windows。其余内容只报告，附精确字段名
+- **先预览后应用**：归档先暂存检查；确认对话框展示完整重定位计划（from → to，本机是否存在）以及本机回环（`127.0.0.1`）、局域网（`192.168.x.x`）URL、缺失路径、内嵌源路径命令的警告
+- **`mcp.json` 纳入核心配置**同步；`mcp-auth.json` 保持可选
+- **额外配置文件白名单**：同步 agent 目录根下的插件配置（`pi-fff.json`、`open-tui.json` 等）—— 通过 Configure Active Profile 显式开启，带发现菜单。`sync_config.json` 硬排除
+- **安全加固**：归档校验收紧（仅平铺 `config/<name>.json`、保留名拒绝、大小写冲突检查、暂存后拒绝符号链接）
+- **支持 `PI_CODING_AGENT_DIR`**：打包、恢复与 sync 配置本身均遵循 Pi 的 agent 目录覆盖
+- `settings.packages` 差异报告支持对象形式 `{ source, … }`
+- 测试：64 个路径适配 + 24 个归档校验 + 36 个端到端用例（通过 mock WebDAV 服务器驱动真实插件）—— `npm test`
 
 ### v1.3.8
 

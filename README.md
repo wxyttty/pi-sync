@@ -25,7 +25,7 @@ If you run Pi on multiple PCs / WSL / servers, reinstalling models, skills, and 
 Requires [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) and either a **WebDAV** endpoint (TeraCLOUD, 坚果云 / Jianguoyun, Nextcloud, ownCloud, …) or an **S3-compatible** bucket (Amazon S3, MinIO, Cloudflare R2, …).
 
 ```bash
-pi install git:github.com/BevalZ/pi-sync@v1.3.7
+pi install git:github.com/BevalZ/pi-sync@v1.4.0
 ```
 
 Then restart Pi or run `/reload`.
@@ -50,7 +50,7 @@ Keyboard hints (as shown in the TUI): `↵` select · `↑↓` navigate · `Esc`
 
 ```bash
 # 1. Install
-pi install git:github.com/BevalZ/pi-sync@v1.3.7
+pi install git:github.com/BevalZ/pi-sync@v1.4.0
 
 # 2. Open the menu (first run starts the setup wizard if WebDAV is empty)
 /sync
@@ -114,11 +114,26 @@ See `docs/sync_config.example.json` for a no-secrets multi-profile template.
 
 | Component | Default | Notes |
 |-----------|---------|-------|
-| Config | ON | `models.json`, `settings.json`, `auth.json` |
+| Config | ON | `models.json`, `settings.json`, `auth.json`, `mcp.json` |
+| Extra config files | OFF (allowlist) | plugin configs in the agent dir root, e.g. `pi-fff.json` — pick files under **Configure Active Profile → Extra config files** |
 | Skills | ON | entire `~/.pi/agent/skills` |
 | Extensions | ON | `~/.pi/agent/extensions` (the sync plugin itself is excluded from the zip) |
 
+`sync_config.json` (cloud credentials) is never packed or restored. `mcp-auth.json` (OAuth grants) is not synced by default either — add it to the extra-config allowlist only if you understand the implications.
+
 Toggle any of these under **Configure Active Profile**.
+
+### Cross-system path portability
+
+Backups made with v1.4.0+ carry a `manifest.json` that records the source machine's home and agent directories. On restore:
+
+- Absolute paths in **known path fields** (`settings.json` resources like `extensions` / `skills` / `prompts` / `themes`, `sessionDir`, `shellPath`, and `mcp.json` `command` / `cwd` / whole-path `args`) are **rebased** from the source home to this machine's home — `/home/alice/…` → `/home/bob/…`, `C:\Users\wxy\…` → `/home/bob/…`, with separator conversion. Paths inside the source agent dir are rebased to this machine's agent dir (which also respects `PI_CODING_AGENT_DIR`).
+- Resource control prefixes (`!`, `+`, `-`) and non-path entries (`npm:…`, `git:…`, `builtin:…`, URLs) pass through untouched.
+- Everything else is **report-only**: the restore preview and report list device-local URLs (`127.0.0.1` / `localhost`), LAN-private URLs (`192.168.x.x` …), absolute paths that do not exist here, and commands embedding source-machine paths — with field names like `models.providers.magpie.baseUrl` so you can fix them quickly.
+- The full rebase/warning plan is shown **before** you confirm the restore; what you see is exactly what gets applied (the archive is staged and inspected first, nothing touches your agent dir before confirmation).
+- Legacy archives without a manifest restore verbatim, with a warning to review paths manually. A malformed manifest fails the inspection instead of being silently ignored.
+
+Unknown plugin-config files from the allowlist are never rewritten — only scanned and reported.
 
 ### Backup filename
 
@@ -132,9 +147,10 @@ The trailing platform tag (`windows11` / `windows10` / `macos` / `linux`) shows 
 
 ### Safety on restore
 
+- The archive is extracted to a staging directory first, inspected (entry validation, no symlinks, manifest, path rebases), and the full plan is shown before anything is written
 - Existing config files get a timestamped `.bak` copy before overwrite
 - Existing skills / extensions folders are renamed to `*-backup-<timestamp>` before replace/merge
-- Restore shows a plan and asks for confirmation
+- Restore shows a plan (including path portability) and asks for confirmation
 - After a successful restore you can reload the agent runtime to apply skills/extensions
 
 ## Bootstrap (new Windows machine, no Pi yet)
@@ -203,6 +219,17 @@ pi-sync/
 ```
 
 ## Changelog
+
+### v1.4.0
+
+- **Cross-system path portability**: backups carry a `manifest.json` (source home/agent dir/platform). On restore, absolute paths in known fields (`settings.json` resources, `sessionDir`, `shellPath`, `mcp.json` command/cwd/args) are rebased to this machine — Linux↔Windows included. Everything else is report-only with precise field names
+- **Restore preview before apply**: the archive is staged and inspected first; the confirm dialog shows the exact rebase plan (from → to, exists here?) plus warnings for device-local (`127.0.0.1`) and LAN-private (`192.168.x.x`) URLs, missing paths, and commands embedding source paths
+- **`mcp.json` is now synced** as a core config file; `mcp-auth.json` stays opt-in
+- **Extra config files (allowlist)**: sync plugin configs from the agent dir root (`pi-fff.json`, `open-tui.json`, …) — explicit opt-in via Configure Active Profile, with a discovery menu. `sync_config.json` is hard-excluded
+- **Security hardening**: archive validation tightened (flat `config/<name>.json` only, reserved names rejected, case-collision checks, symlink rejection after staging)
+- **`PI_CODING_AGENT_DIR` support**: packing, restore, and the sync config itself now respect Pi's agent-dir override
+- `settings.packages` diff handles the object form `{ source, … }`
+- Tests: 64 path-portability + 24 archive-validation + 36 end-to-end cases (real extension driven through a mock WebDAV server) — `npm test`
 
 ### v1.3.8
 
